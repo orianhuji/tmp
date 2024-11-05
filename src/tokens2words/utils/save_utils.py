@@ -1,5 +1,5 @@
 import os
-import pandas as pd
+
 
 def save_df_to_dir(results_df, base_dir, sub_dirs, file_name_format, add_context, model_name):
     # Get the root directory of the project

@@ -2,8 +2,6 @@ import random
 
 import torch
 
-from Utils.MultiTokenKind import MultiTokenKind
-
 
 class RetrievalProcessor:
     def __init__(self, model, tokenizer, multi_token_kind, num_tokens_to_generate,

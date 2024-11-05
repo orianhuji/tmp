@@ -2,10 +2,9 @@ import torch
 from tqdm import tqdm
 from abc import ABC, abstractmethod
 
-from Utils.MultiTokenKind import MultiTokenKind
-from Utils.Processor import RetrievalProcessor
-from Utils.RetrievalTechniques import RetrievalTechniques
-from Utils.standalone_logit_lens import ReverseLogitLens
+from utils.enums import MultiTokenKind, RetrievalTechniques
+from processor import RetrievalProcessor
+from utils.logit_lens import ReverseLogitLens
 
 
 class WordRetrieverBase(ABC):
