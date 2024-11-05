@@ -1,5 +1,6 @@
 import torch
 from tqdm import tqdm
+from abc import ABC, abstractmethod
 
 from Utils.MultiTokenKind import MultiTokenKind
 from Utils.Processor import RetrievalProcessor
@@ -7,60 +8,56 @@ from Utils.RetrievalTechniques import RetrievalTechniques
 from Utils.standalone_logit_lens import ReverseLogitLens
 
 
-class PatchscopesRetriever:
+class WordRetrieverBase(ABC):
     def __init__(self, model, tokenizer):
+        self.model = model
+        self.tokenizer = tokenizer
+
+    @abstractmethod
+    def retrieve_word(self, new_vector, layer_idx=0, num_tokens_to_generate=3):
+        pass
+
+
+class PatchscopesRetriever(WordRetrieverBase):
+    def __init__(self, model, tokenizer):
+        super().__init__(model, tokenizer)
         self.source_input_ids = self.generate_states(tokenizer)
         source_tokens = tokenizer.tokenize(self.generate_prompt())
         self.start_index = source_tokens.index(')')
         self.end_index = source_tokens.index('2')
-        self.tokenizer = tokenizer
-        self.model = model
 
     def generate_states(self, tokenizer, word='Wakanda', with_prompt=True):
-        if with_prompt:
-            prompt = self.generate_prompt()
-        else:
-            prompt = word
+        prompt = self.generate_prompt() if with_prompt else word
         input_ids = tokenizer.encode(prompt, return_tensors='pt')
         return input_ids
 
     def generate_prompt(self, word='Wakanda'):
-        return f"""Next is the same word twice: 1){word} 2)"""
+        return f"Next is the same word twice: 1){word} 2)"
 
     def retrieve_word(self, new_vector, layer_idx=0, num_tokens_to_generate=3):
-        results = []
-        for i in range(num_tokens_to_generate):
-            input_embeddings = self.model.get_input_embeddings()(self.source_input_ids)
-            input_embeddings = torch.cat([
-                torch.cat([input_embeddings[:, :self.start_index + 2, :], new_vector.unsqueeze(0)], dim=1),
-                input_embeddings[:, self.end_index:, :]
-            ], dim=1)
-            with torch.no_grad():
-                outputs = self.model(inputs_embeds=input_embeddings)
-            next_token_logits = outputs.logits[:, -1, :]
-            next_token_id = torch.argmax(next_token_logits, dim=-1).unsqueeze(-1)
-            self.source_input_ids = torch.cat([self.source_input_ids, next_token_id], dim=-1)
-            results.append(next_token_id)
+        input_ids = self.source_input_ids
+        input_embeddings = self.model.get_input_embeddings()(input_ids)
+        input_embeddings = torch.cat([
+            torch.cat([input_embeddings[:, :self.start_index + 1, :], new_vector.unsqueeze(0)], dim=1),
+            input_embeddings[:, self.end_index:, :]
+        ], dim=1)
+        with torch.no_grad():
+            output = self.model.generate(inputs_embeds=input_embeddings, max_new_tokens=num_tokens_to_generate)
+            repeated_text = self.tokenizer.decode(output[0], skip_special_tokens=True)
+        return repeated_text
 
-        generated_word_tokens = [self.tokenizer.decode(token_id[0]) for token_id in results]
-        generated_word_str = "".join(generated_word_tokens).replace(" ", "")
-
-        return generated_word_tokens, generated_word_str
-
-
-class ReverseLogitLensRetriever:
+class ReverseLogitLensRetriever(WordRetrieverBase):
     def __init__(self, model, tokenizer, device='cuda', dtype=torch.float16):
+        super().__init__(model, tokenizer)
         self.reverse_logit_lens = ReverseLogitLens.from_model(model).to(device).to(dtype)
-        self.tokenizer = tokenizer
-        self.model = model
 
-    def retrieve_word(self, new_vector, layer_idx, num_tokens_to_generate=3):
+    def retrieve_word(self, new_vector, layer_idx=0, num_tokens_to_generate=3):
         result = self.reverse_logit_lens(new_vector, layer_idx)
         token = self.tokenizer.decode(torch.argmax(result, dim=-1).item())
         return token
 
 
-class WordRetriever:
+class AnalysisWordRetriever:
     def __init__(self, model, tokenizer, multi_token_kind, num_tokens_to_generate=1, add_context=True,
                  model_name='LLaMa-2B', device='cuda', dataset=None):
         self.model = model.to(device)
@@ -71,22 +68,25 @@ class WordRetriever:
         self.model_name = model_name
         self.device = device
         self.dataset = dataset
-        self.retriever = PatchscopesRetriever(model,
-                                              tokenizer) if multi_token_kind == self.multi_token_kind.Natural else ReverseLogitLensRetriever(
-            model, tokenizer)
-        self.RetrievalTechniques = RetrievalTechniques.Patchscopes if self.multi_token_kind == self.multi_token_kind.Natural else RetrievalTechniques.ReverseLogitLens
+        self.retriever = self._initialize_retriever()
+        self.RetrievalTechniques = (RetrievalTechniques.Patchscopes if self.multi_token_kind == MultiTokenKind.Natural
+                                    else RetrievalTechniques.ReverseLogitLens)
         self.whitespace_token = 'Ġ' if model_name in ['gemma-2-9b', 'pythia-6.9b', 'LLaMA3-8B', 'Yi-6B'] else '▁'
         self.processor = RetrievalProcessor(self.model, self.tokenizer, self.multi_token_kind,
-                                            self.num_tokens_to_generate,
-                                            self.add_context, self.model_name, self.whitespace_token)
+                                            self.num_tokens_to_generate, self.add_context, self.model_name,
+                                            self.whitespace_token)
+
+    def _initialize_retriever(self):
+        if self.multi_token_kind == MultiTokenKind.Natural:
+            return PatchscopesRetriever(self.model, self.tokenizer)
+        else:
+            return ReverseLogitLensRetriever(self.model, self.tokenizer)
 
     def retrieving_words_in_dataset(self, number_of_corpora_to_retrieve=2, max_length=1000):
         self.model.eval()
-
         results = []
 
         for text in tqdm(self.dataset['train']['text'][:number_of_corpora_to_retrieve], self.model_name):
-
             tokenized_input = self.tokenizer(text, return_tensors='pt', truncation=True, max_length=max_length).to(
                 self.device)
             tokens = tokenized_input.input_ids[0]
@@ -110,9 +110,8 @@ class WordRetriever:
                     hidden_states = outputs.hidden_states
                     for layer_idx, hidden_state in enumerate(hidden_states):
                         postfix_hidden_state = hidden_states[layer_idx][0, -1, :].unsqueeze(0)
-                        retrieved_word_str = self.retriever.retrieve_word(postfix_hidden_state,
-                                                                          num_tokens_to_generate=len(
-                                                                              word_tokens), layer_idx=layer_idx)
+                        retrieved_word_str = self.retriever.retrieve_word(
+                            postfix_hidden_state, num_tokens_to_generate=len(word_tokens), layer_idx=layer_idx)
                         results.append({
                             'text': combined_text,
                             'original_word': original_word,
@@ -123,7 +122,6 @@ class WordRetriever:
                             'retrieved_word_str': retrieved_word_str,
                             'context': "With Context" if self.add_context else "Without Context"
                         })
-                    break
                 else:
                     i = j
         return results
