@@ -2,9 +2,9 @@ import torch
 from tqdm import tqdm
 from abc import ABC, abstractmethod
 
-from utils.enums import MultiTokenKind, RetrievalTechniques
-from processor import RetrievalProcessor
-from utils.logit_lens import ReverseLogitLens
+from .utils.enums import MultiTokenKind, RetrievalTechniques
+from .processor import RetrievalProcessor
+from .utils.logit_lens import ReverseLogitLens
 
 
 class WordRetrieverBase(ABC):
@@ -13,45 +13,80 @@ class WordRetrieverBase(ABC):
         self.tokenizer = tokenizer
 
     @abstractmethod
-    def retrieve_word(self, new_vector, layer_idx=0, num_tokens_to_generate=3):
+    def retrieve_word(self, hidden_states, layer_idx=None, num_tokens_to_generate=3):
         pass
 
 
 class PatchscopesRetriever(WordRetrieverBase):
-    def __init__(self, model, tokenizer):
+    def __init__(
+            self,
+            model,
+            tokenizer,
+            prompt: str = "Next is the same word twice: 1) {word} 2)",
+            prompt_target_placeholder: str = "{word}",
+    ):
         super().__init__(model, tokenizer)
-        self.source_input_ids = self.generate_states(tokenizer)
-        source_tokens = tokenizer.tokenize(self.generate_prompt())
-        self.start_index = source_tokens.index(')')
-        self.end_index = source_tokens.index('2')
+        self.prompt_input_ids, self.prompt_target_idx = \
+            self._build_prompt_input_ids_template(prompt, prompt_target_placeholder)
+
+    def _build_prompt_input_ids_template(self, prompt, target_placeholder):
+        prompt_input_ids = [self.tokenizer.bos_token_id] if self.tokenizer.bos_token_id is not None else []
+        target_idx = []
+
+        if prompt:
+            assert target_placeholder is not None, \
+                "Trying to set a prompt for Patchscopes without defining the prompt's target placeholder string, e.g., [MASK]"
+
+            prompt_parts = prompt.split(target_placeholder)
+            for part_i, prompt_part in enumerate(prompt_parts):
+                prompt_input_ids += self.tokenizer.encode(prompt_part, add_special_tokens=False)
+                if part_i < len(prompt_parts)-1:
+                    target_idx += [len(prompt_input_ids)]
+                    prompt_input_ids += [0]
+        else:
+            prompt_input_ids += [0]
+            target_idx = [len(prompt_input_ids)]
+
+        prompt_input_ids = torch.tensor(prompt_input_ids, dtype=torch.long)
+        target_idx = torch.tensor(target_idx, dtype=torch.long)
+        return prompt_input_ids, target_idx
 
     def generate_states(self, tokenizer, word='Wakanda', with_prompt=True):
         prompt = self.generate_prompt() if with_prompt else word
         input_ids = tokenizer.encode(prompt, return_tensors='pt')
         return input_ids
 
-    def generate_prompt(self, word='Wakanda'):
-        return f"Next is the same word twice: 1){word} 2)"
+    def retrieve_word(self, hidden_states, layer_idx=None, num_tokens_to_generate=3):
+        self.model.eval()
 
-    def retrieve_word(self, new_vector, layer_idx=0, num_tokens_to_generate=3):
-        input_ids = self.source_input_ids
-        input_embeddings = self.model.get_input_embeddings()(input_ids)
-        input_embeddings = torch.cat([
-            torch.cat([input_embeddings[:, :self.start_index + 1, :], new_vector.unsqueeze(0)], dim=1),
-            input_embeddings[:, self.end_index:, :]
-        ], dim=1)
+        # insert hidden states into patchscopes prompt
+        if hidden_states.dim() == 1:
+            hidden_states = hidden_states.unsqueeze(0)
+
+        inputs_embeds = self.model.get_input_embeddings()(self.prompt_input_ids.to(self.model.device)).unsqueeze(0)
+        batched_patchscope_inputs = inputs_embeds.repeat(len(hidden_states), 1, 1)
+        batched_patchscope_inputs[:, self.prompt_target_idx] = hidden_states.unsqueeze(1).to(self.model.device)
+
+        attention_mask = (self.prompt_input_ids != self.tokenizer.eos_token_id).long().unsqueeze(0).repeat(
+            len(hidden_states), 1).to(self.model.device)
+
         with torch.no_grad():
-            output = self.model.generate(inputs_embeds=input_embeddings, max_new_tokens=num_tokens_to_generate)
-            repeated_text = self.tokenizer.decode(output[0], skip_special_tokens=True)
-        return repeated_text
+            patchscope_outputs = self.model.generate(
+                do_sample=False, num_beams=1, top_p=1.0, temperature=None,
+                inputs_embeds=batched_patchscope_inputs, attention_mask=attention_mask,
+                max_new_tokens=num_tokens_to_generate, pad_token_id=self.tokenizer.eos_token_id, )
+
+        decoded_patchscope_outputs = self.tokenizer.batch_decode(patchscope_outputs)
+        return decoded_patchscope_outputs
+
 
 class ReverseLogitLensRetriever(WordRetrieverBase):
     def __init__(self, model, tokenizer, device='cuda', dtype=torch.float16):
         super().__init__(model, tokenizer)
         self.reverse_logit_lens = ReverseLogitLens.from_model(model).to(device).to(dtype)
 
-    def retrieve_word(self, new_vector, layer_idx=0, num_tokens_to_generate=3):
-        result = self.reverse_logit_lens(new_vector, layer_idx)
+    def retrieve_word(self, hidden_states, layer_idx=None, num_tokens_to_generate=3):
+        result = self.reverse_logit_lens(hidden_states, layer_idx)
         token = self.tokenizer.decode(torch.argmax(result, dim=-1).item())
         return token
 
@@ -81,11 +116,11 @@ class AnalysisWordRetriever:
         else:
             return ReverseLogitLensRetriever(self.model, self.tokenizer)
 
-    def retrieving_words_in_dataset(self, number_of_corpora_to_retrieve=2, max_length=1000):
+    def retrieve_words_in_dataset(self, number_of_examples_to_retrieve=2, max_length=1000):
         self.model.eval()
         results = []
 
-        for text in tqdm(self.dataset['train']['text'][:number_of_corpora_to_retrieve], self.model_name):
+        for text in tqdm(self.dataset['train']['text'][:number_of_examples_to_retrieve], self.model_name):
             tokenized_input = self.tokenizer(text, return_tensors='pt', truncation=True, max_length=max_length).to(
                 self.device)
             tokens = tokenized_input.input_ids[0]
@@ -109,8 +144,8 @@ class AnalysisWordRetriever:
                     hidden_states = outputs.hidden_states
                     for layer_idx, hidden_state in enumerate(hidden_states):
                         postfix_hidden_state = hidden_states[layer_idx][0, -1, :].unsqueeze(0)
-                        retrieved_word_str = self.retriever.retrieve_word(
-                            postfix_hidden_state, num_tokens_to_generate=len(word_tokens), layer_idx=layer_idx)
+                        retrieved_word_str = self.retriever.retrieve_word(postfix_hidden_state, layer_idx=layer_idx,
+                                                                          num_tokens_to_generate=len(word_tokens))
                         results.append({
                             'text': combined_text,
                             'original_word': original_word,
