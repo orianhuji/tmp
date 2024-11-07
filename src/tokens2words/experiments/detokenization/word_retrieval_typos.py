@@ -7,7 +7,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from ...utils.enums import MultiTokenKind
 from ...word_retriever import AnalysisWordRetriever
-from ...utils.save_utils import save_df_to_dir
+from ...utils.file_utils import save_df_to_dir
 
 from utils import MODELS_MAP, dtype_arg, load_dataset_for_analysis
 
@@ -23,7 +23,7 @@ def process_dataset_for_models(models_info, dataset):
 
         for add_context in [True]:
             print(f"Processing model: {model_name} with context: {add_context}")
-            results = word_retriever.retrieving_words_in_dataset(number_of_corpora_to_retrieve=4)
+            results = word_retriever.retrieve_words_in_dataset(number_of_examples_to_retrieve=4)
             results_df = pd.DataFrame(results)
             print(results_df)
 
@@ -33,7 +33,7 @@ def process_dataset_for_models(models_info, dataset):
                 sub_dirs=["outputs", "retrieval", "multi_tokens"],
                 file_name_format=f"{model_name}_results_with_context_typos.csv" if add_context else f"{model_name}_results_without_context_typos.csv",
                 add_context=True,
-                model_name="LLaMA3-8B"
+                model_name=model_name,
             )
 
 

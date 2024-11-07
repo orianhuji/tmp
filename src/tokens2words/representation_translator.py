@@ -6,7 +6,7 @@ import torch
 from torch import nn
 from torch.utils.data import Dataset, IterableDataset
 
-from utils.model_utils import learn_linear_map, extract_vocab_hidden_states
+from .utils.model_utils import learn_linear_map, extract_vocab_hidden_states
 
 
 class RepresentationTranslator(ABC, nn.Module):
