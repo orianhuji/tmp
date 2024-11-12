@@ -5,6 +5,7 @@ from abc import ABC, abstractmethod
 from .utils.enums import MultiTokenKind, RetrievalTechniques
 from .processor import RetrievalProcessor
 from .utils.logit_lens import ReverseLogitLens
+from .utils.model_utils import extract_token_i_hidden_states
 
 
 class WordRetrieverBase(ABC):
@@ -22,12 +23,19 @@ class PatchscopesRetriever(WordRetrieverBase):
             self,
             model,
             tokenizer,
-            prompt: str = "Next is the same word twice: 1) {word} 2)",
+            representation_prompt: str = "{word}",
+            patchscopes_prompt: str = "Next is the same word twice: 1) {word} 2)",
             prompt_target_placeholder: str = "{word}",
+            representation_token_idx_to_extract: int = -1,
+            num_tokens_to_generate: int = 10,
     ):
         super().__init__(model, tokenizer)
         self.prompt_input_ids, self.prompt_target_idx = \
-            self._build_prompt_input_ids_template(prompt, prompt_target_placeholder)
+            self._build_prompt_input_ids_template(patchscopes_prompt, prompt_target_placeholder)
+        self._prepare_representation_prompt = \
+            self._build_representation_prompt_func(representation_prompt, prompt_target_placeholder)
+        self.representation_token_idx = representation_token_idx_to_extract
+        self.num_tokens_to_generate = num_tokens_to_generate
 
     def _build_prompt_input_ids_template(self, prompt, target_placeholder):
         prompt_input_ids = [self.tokenizer.bos_token_id] if self.tokenizer.bos_token_id is not None else []
@@ -51,12 +59,15 @@ class PatchscopesRetriever(WordRetrieverBase):
         target_idx = torch.tensor(target_idx, dtype=torch.long)
         return prompt_input_ids, target_idx
 
+    def _build_representation_prompt_func(self, prompt, target_placeholder):
+        return lambda word: prompt.replace(target_placeholder, word)
+
     def generate_states(self, tokenizer, word='Wakanda', with_prompt=True):
         prompt = self.generate_prompt() if with_prompt else word
         input_ids = tokenizer.encode(prompt, return_tensors='pt')
         return input_ids
 
-    def retrieve_word(self, hidden_states, layer_idx=None, num_tokens_to_generate=3):
+    def retrieve_word(self, hidden_states, layer_idx=None, num_tokens_to_generate=None):
         self.model.eval()
 
         # insert hidden states into patchscopes prompt
@@ -70,6 +81,8 @@ class PatchscopesRetriever(WordRetrieverBase):
         attention_mask = (self.prompt_input_ids != self.tokenizer.eos_token_id).long().unsqueeze(0).repeat(
             len(hidden_states), 1).to(self.model.device)
 
+        num_tokens_to_generate = num_tokens_to_generate if num_tokens_to_generate else self.num_tokens_to_generate
+
         with torch.no_grad():
             patchscope_outputs = self.model.generate(
                 do_sample=False, num_beams=1, top_p=1.0, temperature=None,
@@ -78,6 +91,21 @@ class PatchscopesRetriever(WordRetrieverBase):
 
         decoded_patchscope_outputs = self.tokenizer.batch_decode(patchscope_outputs)
         return decoded_patchscope_outputs
+
+    def extract_hidden_states(self, word):
+        representation_input = self._prepare_representation_prompt(word)
+
+        last_token_hidden_states = extract_token_i_hidden_states(
+            self.model, self.tokenizer, representation_input, token_idx_to_extract=self.representation_token_idx, return_dict=False, verbose=False)
+
+        return last_token_hidden_states
+
+    def get_hidden_states_and_retrieve_word(self, word, num_tokens_to_generate=None):
+        last_token_hidden_states = self.extract_hidden_states(word)
+        patchscopes_description_by_layers = self.retrieve_word(
+            last_token_hidden_states, num_tokens_to_generate=num_tokens_to_generate)
+
+        return patchscopes_description_by_layers, last_token_hidden_states
 
 
 class ReverseLogitLensRetriever(WordRetrieverBase):

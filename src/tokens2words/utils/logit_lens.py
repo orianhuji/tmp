@@ -12,32 +12,23 @@ result = lens(hidden_state, layer_index)  # layer_index is not really used, you 
 """
 
 import abc
-import inspect
-import json
 import logging
-from dataclasses import asdict, dataclass
-from pathlib import Path
 
 import copy
-from dataclasses import dataclass
-from typing import Literal, Optional, cast, Any, Generator, TypeVar, Union, Dict
+from typing import Union
 
-import torch as th
+import torch
 from torch import nn
-from torch.distributions import Distribution
 import torch.nn.functional as F
 
-import transformers as tr
+import transformers
 from transformers import models
 from transformers import PreTrainedModel
 
 
-logger = logging.getLogger(__name__)
-
-
-Model = Union[tr.PreTrainedModel]
+Model = Union[PreTrainedModel]
 Norm = Union[
-    th.nn.LayerNorm,
+    nn.LayerNorm,
     models.llama.modeling_llama.LlamaRMSNorm,
     models.gemma.modeling_gemma.GemmaRMSNorm,
     models.gemma2.modeling_gemma2.Gemma2RMSNorm,
@@ -47,7 +38,7 @@ Norm = Union[
 
 def get_unembedding_matrix(model: Model) -> nn.Linear:
     """The final linear tranformation from the model hidden state to the output."""
-    if isinstance(model, tr.PreTrainedModel):
+    if isinstance(model, PreTrainedModel):
         unembed = model.get_output_embeddings()
         if not isinstance(unembed, nn.Linear):
             raise ValueError("We currently only support linear unemebdings")
@@ -58,7 +49,7 @@ def get_unembedding_matrix(model: Model) -> nn.Linear:
 
 def get_embedding_matrix(model: nn.Module) -> nn.Embedding:
     """The initial embedding matrix from the input tokens to the model hidden state."""
-    if isinstance(model, tr.PreTrainedModel):
+    if isinstance(model, PreTrainedModel):
         embed = model.get_input_embeddings()
         if not isinstance(embed, nn.Embedding):
             raise ValueError("We currently only support embedding matrices")
@@ -110,11 +101,11 @@ def get_final_norm(model: Model) -> Norm:
     return final_layer_norm
 
 
-class Unembed(th.nn.Module):
+class Unembed(nn.Module):
     """Module that maps transformer hidden states to logits (and vice versa)."""
 
     final_norm: Norm
-    unembedding: th.nn.Linear
+    unembedding: nn.Linear
 
     def __init__(
         self,
@@ -135,14 +126,14 @@ class Unembed(th.nn.Module):
         # In general we don't want to finetune the unembed operation.
         self.requires_grad_(False)
 
-    def forward(self, h: th.Tensor) -> th.Tensor:
+    def forward(self, h: torch.Tensor) -> torch.Tensor:
         """Convert hidden states into logits."""
         return self.unembedding(self.final_norm(h))
 
 
-class Reembed(th.nn.Module):
+class Reembed(nn.Module):
     """Module that maps transformer hidden states to logits (and vice versa)."""
-    embedding: th.Tensor
+    embedding: torch.Tensor
 
     def __init__(
         self,
@@ -164,11 +155,11 @@ class Reembed(th.nn.Module):
         # In general we don't want to finetune the unembed operation.
         self.requires_grad_(False)
 
-    def forward(self, hidden_state: th.Tensor) -> th.Tensor:
+    def forward(self, hidden_state: torch.Tensor) -> torch.Tensor:
         """Convert hidden states into logits."""
         
         if self.distance_metric == 'logits':
-            logits = th.matmul(hidden_state, self.embedding.T).squeeze(0)
+            logits = torch.matmul(hidden_state, self.embedding.T).squeeze(0)
 
         elif self.distance_metric == 'cosine':
             # Normalize E and h
@@ -176,21 +167,21 @@ class Reembed(th.nn.Module):
             h_normalized = F.normalize(hidden_state, p=2, dim=-1)
 
             # Compute cosine similarity
-            logits = th.matmul(h_normalized, E_normalized.T).squeeze(0)
+            logits = torch.matmul(h_normalized, E_normalized.T).squeeze(0)
 
         elif self.distance_metric == 'euclidean':
             # Compute Euclidean distance
-            distances = th.cdist(hidden_state, self.embedding, p=2).squeeze(0)
+            distances = torch.cdist(hidden_state, self.embedding, p=2).squeeze(0)
 
             # Convert distances to logits (negative distance for logits-like values)
             logits = -distances
 
         else:  # Compute regular dot-product as a similarity measure
-            logits = th.matmul(hidden_state, self.embedding.T).squeeze(0)
+            logits = torch.matmul(hidden_state, self.embedding.T).squeeze(0)
         return logits
 
 
-class ReverseLens(abc.ABC, th.nn.Module):
+class ReverseLens(abc.ABC, nn.Module):
     """Abstract base class for all Lens."""
 
     reembed: Reembed
@@ -206,7 +197,7 @@ class ReverseLens(abc.ABC, th.nn.Module):
         self.reembed = reembed
 
     @abc.abstractmethod
-    def forward(self, h: th.Tensor, idx: int) -> th.Tensor:
+    def forward(self, h: torch.Tensor, idx: int) -> torch.Tensor:
         """Decode hidden states into logits."""
         ...
 
@@ -240,7 +231,7 @@ class ReverseLogitLens(ReverseLens):
         reembed = Reembed(model)
         return cls(reembed)
 
-    def forward(self, h: th.Tensor, idx: int) -> th.Tensor:
+    def forward(self, h: torch.Tensor, idx: int) -> torch.Tensor:
         """Decode a hidden state into logits.
 
         Args:
@@ -251,7 +242,7 @@ class ReverseLogitLens(ReverseLens):
         return self.reembed.forward(h)
 
 
-class Lens(abc.ABC, th.nn.Module):
+class Lens(abc.ABC, nn.Module):
     """Abstract base class for all Lens."""
 
     unembed: Unembed
@@ -267,7 +258,7 @@ class Lens(abc.ABC, th.nn.Module):
         self.unembed = unembed
 
     @abc.abstractmethod
-    def forward(self, h: th.Tensor, idx: int) -> th.Tensor:
+    def forward(self, h: torch.Tensor, idx: int) -> torch.Tensor:
         """Decode hidden states into logits."""
         ...
 
@@ -301,8 +292,7 @@ class LogitLens(Lens):
         unembed = Unembed(model)
         return cls(unembed)
 
-
-    def forward(self, h: th.Tensor, idx: int) -> th.Tensor:
+    def forward(self, h: torch.Tensor, idx: int) -> torch.Tensor:
         """Decode a hidden state into logits.
 
         Args:

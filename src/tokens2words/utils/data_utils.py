@@ -1,11 +1,11 @@
 import re
 from datasets import load_dataset, Dataset
-import tensorflow_datasets as tfds
+from itertools import chain
 
 LANGUAGES_TO_DECODE_FROM_BYTES = ["he"]
 
 
-def load_pretrain_dataset(dataset_name, language="en", split=None):
+def load_lm_dataset(dataset_name, language="en", split=None):
     """
     Loads a popular pretraining or perplexity evaluation dataset by name and language.
 
@@ -41,7 +41,8 @@ def load_pretrain_dataset(dataset_name, language="en", split=None):
             "Dataset not recognized. Available options: 'wikitext-2', 'wikitext-103', 'pg19', 'c4', 'wiki40b', 'mc4'.")
 
 
-def extract_unique_words(dataset: Dataset, split: str = "validation", text_column: str = "text", max_samples: int = None):
+def extract_new_words_from_dataset(
+        dataset: Dataset, tokenizer, text_column: str = "text", max_samples: int = None, filter_func=(lambda word, token_count: True)):
     """
     Loads a Hugging Face dataset and extracts all unique words from the specified text column.
 
@@ -54,8 +55,6 @@ def extract_unique_words(dataset: Dataset, split: str = "validation", text_colum
     Returns:
         set: A set of unique words in the dataset.
     """
-    if split is not None:
-        dataset = dataset[split]
     if max_samples:
         dataset = dataset.select(range(max_samples))
 
@@ -64,10 +63,65 @@ def extract_unique_words(dataset: Dataset, split: str = "validation", text_colum
     word_pattern = re.compile(r"\b\w+(?:[-']\w+)*\b")
 
     # Iterate over each entry in the dataset and extract unique words
-    unique_words = set()
+    new_words = list()
     for record in dataset:
         text = record.get(text_column, "")
         words = word_pattern.findall(text)
-        unique_words.update(words)
+        for word in words:
+            tokens = tokenizer.tokenize(word)
+            token_count = len(tokens)
+            if (token_count > 1) and (not tokenizer.vocab.get(word, False)) and filter_func(word, token_count):
+                new_words.append(word)
 
-    return list(unique_words)
+    # remove duplicates and return
+    return list(dict.fromkeys(new_words))
+
+
+# def get_words_in_dataset_by_token_length(data, tokenizer, remove_breaks=False, filter_func=lambda: True):
+#     # dict to map from tokens length (2, 3, 4...) to multi-token words in that length found in the data
+#     num_tokens2multi_token_words = defaultdict(list)
+#
+#     # custom_punctuation = string.punctuation + "“”"
+#     #
+#     # def remove_possessive_s(s):
+#     #     return s[:-2] if (s.endswith("'s") or s.endswith("’s")) else s
+#
+#     # Iterate over the dataset
+#     for example in data:
+#         text = example["text"]
+#         if remove_breaks:
+#             text.replace("--", " ")
+#
+#         words = re.findall(r'\b\w+\b', text)
+#         # words = text.split()
+#
+#         for word in words:
+#             # word = word.strip(custom_punctuation)
+#             # word = remove_possessive_s(word)
+#             tokens = tokenizer.tokenize(word)
+#             token_count = len(tokens)
+#             if (token_count > 1) and (not tokenizer.vocab.get(word, False)) and filter_func(word, token_count):
+#                 num_tokens2multi_token_words[token_count].append(word)
+#
+#     # Remove duplicates in the lists, but keep insertion order
+#     for k in num_tokens2multi_token_words:
+#         num_tokens2multi_token_words[k] = list(dict.fromkeys(num_tokens2multi_token_words[k]))
+#
+#     return num_tokens2multi_token_words
+
+def get_group_texts_func(block_size=1024):
+    def group_texts(examples):
+        # Concatenate all texts.
+        concatenated_examples = {k: list(chain(*examples[k])) for k in examples.keys()}
+        total_length = len(concatenated_examples[list(examples.keys())[0]])
+        # We drop the small remainder, and if the total_length < block_size  we exclude this batch and return an empty dict.
+        # We could add padding if the model supported it instead of this drop, you can customize this part to your needs.
+        total_length = (total_length // block_size) * block_size
+        # Split by chunks of max_len.
+        result = {
+            k: [t[i: i + block_size] for i in range(0, total_length, block_size)]
+            for k, t in concatenated_examples.items()
+        }
+        result["labels"] = result["input_ids"].copy()
+        return result
+    return group_texts

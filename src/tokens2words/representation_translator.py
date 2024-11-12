@@ -1,3 +1,4 @@
+import os
 from tqdm import tqdm
 from abc import ABC, abstractmethod
 from typing import Iterable, Union, List
@@ -9,7 +10,7 @@ from torch.utils.data import Dataset, IterableDataset
 from .utils.model_utils import learn_linear_map, extract_vocab_hidden_states
 
 
-class RepresentationTranslator(ABC, nn.Module):
+class RepresentationTranslators(ABC, nn.Module):
     """
     Abstract class for mapping intermediate model representations to the model's embedding and unembedding spaces.
     """
@@ -66,12 +67,11 @@ class RepresentationTranslator(ABC, nn.Module):
         pass
 
     @abstractmethod
-    def to_embedding(self, layer_index: int, representations: torch.Tensor) -> torch.Tensor:
+    def to_embedding(self, representations: torch.Tensor, **kwargs) -> torch.Tensor:
         """
         Transforms the given representations to the embedding space.
 
         Args:
-            layer_index (int): The index of the model layer the representations were extracted from.
             representations (torch.Tensor): The intermediate representations to transform.
 
         Returns:
@@ -80,12 +80,11 @@ class RepresentationTranslator(ABC, nn.Module):
         pass
 
     @abstractmethod
-    def to_lm_head(self, layer_index: int, representations: torch.Tensor) -> torch.Tensor:
+    def to_lm_head(self, representations: torch.Tensor, **kwargs) -> torch.Tensor:
         """
         Transforms the given representations to the unembedding space.
 
         Args:
-            layer_index (int): The index of the model layer the representations were extracted from.
             representations (torch.Tensor): The intermediate representations to transform.
 
         Returns:
@@ -94,7 +93,7 @@ class RepresentationTranslator(ABC, nn.Module):
         pass
 
 
-class LinearRepresentationTranslator(RepresentationTranslator):
+class LinearRepresentationTranslators(RepresentationTranslators):
     """
     Transforms intermediate model representations to the embedding and unembedding spaces
     using linear maps.
@@ -107,7 +106,7 @@ class LinearRepresentationTranslator(RepresentationTranslator):
             token_ids: Iterable[int] = None,
             prompt: str = "{target}",
             batch_size: int = 128,
-            layer_batch_size: int = None,
+            layer_batch_size: int = 4,
     ) -> None:
         """
         Learns transformations that map representations from every layer to the embedding/unembedding spaces,
@@ -176,13 +175,13 @@ class LinearRepresentationTranslator(RepresentationTranslator):
         """
         raise NotImplementedError("Fine-tuning linear translators on a dataset is not implemented.")
 
-    def to_embedding(self, layer_index: int, representations: torch.Tensor) -> torch.Tensor:
+    def to_embedding(self, representations: torch.Tensor, layer_index: int, **kwargs) -> torch.Tensor:
         """
         Transforms the given representations to the embedding space.
 
         Args:
-            layer_index (int): The index of the model layer the representations were extracted from.
             representations (torch.Tensor): The intermediate representations to transform.
+            layer_index (int): The index of the model layer the representations were extracted from.
 
         Returns:
             torch.Tensor: The transformed representations in embedding space.
@@ -194,13 +193,13 @@ class LinearRepresentationTranslator(RepresentationTranslator):
 
         return self.lm_head_maps[layer_index](representations)
 
-    def to_lm_head(self, layer_index: int, representations: torch.Tensor) -> torch.Tensor:
+    def to_lm_head(self, representations: torch.Tensor, layer_index: int, **kwargs) -> torch.Tensor:
         """
         Transforms the given representations to the unembedding space.
 
         Args:
-            layer_index (int): The index of the model layer the representations were extracted from.
             representations (torch.Tensor): The intermediate representations to transform.
+            layer_index (int): The index of the model layer the representations were extracted from.
 
         Returns:
             torch.Tensor: The transformed representations in unembedding space.

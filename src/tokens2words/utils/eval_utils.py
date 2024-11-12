@@ -1,6 +1,4 @@
 import torch
-import string
-from collections import defaultdict
 
 
 def is_not_number(s):
@@ -46,37 +44,6 @@ def get_texts_containing_word(words, dataset):
             result_texts.append(example["text"])
 
     return result_texts
-
-
-def get_words_in_dataset_by_token_length(data, tokenizer, remove_breaks=False):
-    # dict to map from tokens length (2, 3, 4...) to multi-token words in that length found in the data
-    num_tokens2multi_token_words = defaultdict(list)
-
-    custom_punctuation = string.punctuation + "“”"
-
-    def remove_possessive_s(s):
-        return s[:-2] if (s.endswith("'s") or s.endswith("’s")) else s
-
-    # Iterate over the dataset
-    for example in data:
-        text = example["text"]
-        if remove_breaks:
-            text.replace("--", " ")
-        words = text.split()
-
-        for word in words:
-            word = word.strip(custom_punctuation)
-            word = remove_possessive_s(word)
-            tokens = tokenizer.tokenize(word)
-            token_count = len(tokens)
-            if token_count > 1:
-                num_tokens2multi_token_words[token_count].append(word)
-
-    # Remove duplicates in the lists, but keep insertion order
-    for k in num_tokens2multi_token_words:
-        num_tokens2multi_token_words[k] = list(dict.fromkeys(num_tokens2multi_token_words[k]))
-
-    return num_tokens2multi_token_words
 
 
 def compute_topk_token_rank(logits, labels, k=1000):
