@@ -75,8 +75,18 @@ def count_tokens_in_dataset(dataset, tokenizer, text_column='text'):
     return total_tokens
 
 
+def filter_single_token_words(array, tokenizer, add_space_prefix_for_lower=True):
+    def _is_multi_token(word):
+        if add_space_prefix_for_lower and word[0].islower():
+            word = " " + word
+        return len(tokenizer.encode(word, add_special_tokens=False))
+    token_counts = array.apply(_is_multi_token)
+    mask = token_counts > 1
+    return array[mask], token_counts
+
+
 # TODO make clearer what's its use
-def flip_tensor(tensor):
+def get_last_zero_in_every_seq_mask(tensor):
     # Find where consecutive zeros end
     zero_mask = (tensor == 0)
     diff = torch.diff(zero_mask.int(), dim=1)
@@ -88,5 +98,15 @@ def flip_tensor(tensor):
     return output
 
 
+def get_first_zero_in_every_seq_mask(tensor):
+    # Identify where consecutive zeros begin
+    zero_mask = (tensor == 0)
+    diff = torch.diff(zero_mask.int(), dim=1, prepend=torch.zeros(tensor.size(0), 1, dtype=torch.int).to(tensor.device))
+    first_zero_mask = diff == 1  # Marks the beginning of each sequence of zeros
+
+    # Create the output
+    output = 1 - tensor
+    output[zero_mask & ~first_zero_mask] = 0
+    return output
 
 

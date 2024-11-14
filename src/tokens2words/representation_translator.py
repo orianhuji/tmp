@@ -14,8 +14,11 @@ class RepresentationTranslators(ABC, nn.Module):
     """
     Abstract class for mapping intermediate model representations to the model's embedding and unembedding spaces.
     """
-    embedding_maps: nn.ModuleDict = nn.ModuleDict()
-    lm_head_maps: nn.ModuleDict = nn.ModuleDict()
+
+    def __init__(self):
+        super(RepresentationTranslators, self).__init__()
+        self.embedding_maps = nn.ModuleDict()
+        self.lm_head_maps = nn.ModuleDict()
 
     @abstractmethod
     def fit_on_dataset(
@@ -106,7 +109,7 @@ class LinearRepresentationTranslators(RepresentationTranslators):
             token_ids: Iterable[int] = None,
             prompt: str = "{target}",
             batch_size: int = 128,
-            layer_batch_size: int = 4,
+            layer_batch_size: int = 8,
     ) -> None:
         """
         Learns transformations that map representations from every layer to the embedding/unembedding spaces,
@@ -143,14 +146,15 @@ class LinearRepresentationTranslators(RepresentationTranslators):
             lm_head_weights = lm_head_weights[token_ids]
 
         n_layers = model.config.num_hidden_layers
+        layer_batch_size = n_layers if layer_batch_size is None else layer_batch_size
         for start_layer_i in tqdm(range(1, n_layers+1, layer_batch_size), desc="Fitting maps to embedding and unembedding spaces", unit="Layer batch"):
             layers_to_learn = None if layer_batch_size is None else \
-                list(range(start_layer_i, min(start_layer_i + layer_batch_size, n_layers)))
+                list(range(start_layer_i, min(start_layer_i + layer_batch_size, n_layers+1)))
             all_hidden_states = extract_vocab_hidden_states(model, tokenizer, token_ids, prompt, batch_size, layers_to_learn)
-            for layer in layers_to_learn:
+            for layer in tqdm(layers_to_learn, total=len(layers_to_learn), unit="layers", desc="Fitting maps..."):
                 hidden_states = all_hidden_states[layer]
-                self.embedding_maps[layer] = learn_linear_map(hidden_states, input_embeddings)
-                self.lm_head_maps[layer] = learn_linear_map(hidden_states, lm_head_weights)
+                self.embedding_maps[str(layer)] = learn_linear_map(hidden_states, input_embeddings)
+                self.lm_head_maps[str(layer)] = learn_linear_map(hidden_states, lm_head_weights)
 
                 all_hidden_states[layer] = None
 
@@ -186,12 +190,12 @@ class LinearRepresentationTranslators(RepresentationTranslators):
         Returns:
             torch.Tensor: The transformed representations in embedding space.
         """
-        if self.embedding_maps is None or layer_index not in self.embedding_maps:
+        if self.embedding_maps is None or str(layer_index) not in self.embedding_maps:
             raise ValueError("The mapping has not been trained yet. Call fit first.")
         if not isinstance(representations, torch.Tensor):
             raise TypeError("Representations must be torch.Tensor.")
 
-        return self.lm_head_maps[layer_index](representations)
+        return self.lm_head_maps[str(layer_index)](representations)
 
     def to_lm_head(self, representations: torch.Tensor, layer_index: int, **kwargs) -> torch.Tensor:
         """
@@ -204,9 +208,9 @@ class LinearRepresentationTranslators(RepresentationTranslators):
         Returns:
             torch.Tensor: The transformed representations in unembedding space.
         """
-        if self.lm_head_maps is None or layer_index not in self.lm_head_maps:
+        if self.lm_head_maps is None or str(layer_index) not in self.lm_head_maps:
             raise ValueError("The mapping has not been trained yet. Call fit first.")
         if not isinstance(representations, torch.Tensor):
             raise TypeError("Representations must be torch.Tensor.")
 
-        return self.lm_head_maps[layer_index](representations)
+        return self.lm_head_maps[str(layer_index)](representations)

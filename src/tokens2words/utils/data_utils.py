@@ -1,8 +1,10 @@
 import re
 from datasets import load_dataset, Dataset
 from itertools import chain
+from tqdm import tqdm
 
 LANGUAGES_TO_DECODE_FROM_BYTES = ["he"]
+STREAMING_DATASETS = ["fineweb-edu"]
 
 
 def load_lm_dataset(dataset_name, language="en", split=None):
@@ -25,6 +27,8 @@ def load_lm_dataset(dataset_name, language="en", split=None):
     """
     if dataset_name.lower() == 'wikitext':
         return load_dataset("Salesforce/wikitext", "wikitext-2-raw-v1", split=split)
+    elif dataset_name.lower() == 'fineweb-edu':
+        return load_dataset("HuggingFaceFW/fineweb-edu", name="sample-10BT")
     elif dataset_name.lower() == 'wikitext-103':
         return load_dataset("Salesforce/wikitext", "wikitext-103-raw-v1", split=split)
     elif dataset_name.lower() == 'pg19':
@@ -63,18 +67,23 @@ def extract_new_words_from_dataset(
     word_pattern = re.compile(r"\b\w+(?:[-']\w+)*\b")
 
     # Iterate over each entry in the dataset and extract unique words
+    all_words = list()
     new_words = list()
-    for record in dataset:
+    for record in tqdm(dataset, total=len(dataset), miniters=10, desc="Extracting all words from dataset...", unit="examples"):
         text = record.get(text_column, "")
         words = word_pattern.findall(text)
-        for word in words:
-            tokens = tokenizer.tokenize(word)
-            token_count = len(tokens)
-            if (token_count > 1) and (not tokenizer.vocab.get(word, False)) and filter_func(word, token_count):
-                new_words.append(word)
+        all_words += words
+
+    all_words = list(dict.fromkeys(all_words))
+    token_counts = [len(x) for x in tokenizer(all_words, add_special_tokens=False)["input_ids"]]
+    w_whitespace_token_counts = [len(x) for x in tokenizer([f" {w}" for w in all_words], add_special_tokens=False)["input_ids"]]
+    new_words = [word for word, count, w_whitespace_count in zip(all_words, token_counts, w_whitespace_token_counts) if ((count > 1) and (w_whitespace_count > 1) and filter_func(word, count))]
+    # for word, token_count in tqdm(all_words, total=len(all_words), miniters=10, desc="Finding new words...", unit="words"):
+    #     if (not tokenizer.vocab.get(word, False)) and :
+    #         new_words.append(word)
 
     # remove duplicates and return
-    return list(dict.fromkeys(new_words))
+    return new_words
 
 
 # def get_words_in_dataset_by_token_length(data, tokenizer, remove_breaks=False, filter_func=lambda: True):

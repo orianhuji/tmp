@@ -34,7 +34,6 @@ def extract_token_i_hidden_states(
                 for layer in layers_to_extract:
                     hidden_states = outputs.hidden_states[layer]
                     all_hidden_states[layer].append(hidden_states[:, token_idx_to_extract, :].detach().cpu())
-
     for layer in all_hidden_states:
         all_hidden_states[layer] = torch.concat(all_hidden_states[layer], dim=0)
 
@@ -65,7 +64,7 @@ def extract_vocab_hidden_states(
     with torch.no_grad():
         for i in tqdm(range(0, len(tokens_to_extract), batch_size), desc="Extracting hidden states", unit="batch"):
             prompts = [prompt.format(target=target) for target in tokens_to_extract[i:i+batch_size]]
-            input_ids = tokenizer.encode(prompts, return_tensors="pt")
+            input_ids = tokenizer(prompts, return_tensors="pt")["input_ids"]
             outputs = model(input_ids.to(device), output_hidden_states=True)
             for layer in layers_to_extract:
                 hidden_states = outputs.hidden_states[layer]
