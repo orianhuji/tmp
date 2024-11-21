@@ -12,6 +12,7 @@ import random
 
 import pandas as pd
 from tqdm import tqdm
+import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from accelerate import Accelerator
 from accelerate.utils import set_seed
@@ -38,7 +39,6 @@ def run_patchscopes_on_list(
     model.eval()
     outputs = defaultdict(dict)
     for word in tqdm(words_list, total=len(words_list), desc="Running patchscopes...", miniters=10,):
-
         patchscopes_description_by_layers, _ = patchscopes_retriever.get_hidden_states_and_retrieve_word(
             word, num_tokens_to_generate=patchscopes_n_new_tokens)
 
@@ -56,8 +56,10 @@ def main(args):
     os.makedirs(output_dir, exist_ok=True)
 
     logger.info("Loading model...")
-    accelerator = Accelerator()
-    model = AutoModelForCausalLM.from_pretrained(args.model_name)
+    mixed_precision = "bf16" if torch.cuda.is_bf16_supported() else "fp16"
+    accelerator = Accelerator(mixed_precision=mixed_precision)
+    model = AutoModelForCausalLM.from_pretrained(args.model_name,
+                                                 torch_dtype=torch.bfloat16 if mixed_precision == "bf16" else torch.float16)
     model = accelerator.prepare(model)
     tokenizer = AutoTokenizer.from_pretrained(args.model_name)
 
@@ -69,7 +71,7 @@ def main(args):
     elif args.dataset_name:
         logger.info(f"Building words list from dataset: {args.dataset_name}")
         dataset = load_lm_dataset(args.dataset_name, args.dataset_language)[args.dataset_split]
-        words_list = extract_new_words_from_dataset(dataset, tokenizer, max_samples=args.dataset_max_samples)
+        words_list, word_freqs = extract_new_words_from_dataset(dataset, tokenizer, max_samples=args.dataset_max_samples)
 
     if args.words_filter_numeric:
         words_list = [s for s in words_list if not any(c.isdigit() for c in s)]
@@ -119,7 +121,7 @@ def parse_args():
     parser.add_argument("--dataset_name", type=str, default=None)
     parser.add_argument("--dataset_language", type=str, default=None)
     parser.add_argument("--dataset_split", type=str, default="validation")
-    parser.add_argument("--dataset_max_samples", type=int, default=1000)
+    parser.add_argument("--dataset_max_samples", type=int, default=None)
     parser.add_argument("--words_list", type=str, default=None)
     parser.add_argument("--words_list_delimiter", type=str, default=None)
     parser.add_argument("--words_filter_en", action="store_true", default=False)

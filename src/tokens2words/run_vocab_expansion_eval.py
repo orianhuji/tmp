@@ -4,9 +4,11 @@
 
 import argparse
 import os
+import gc
 import json
 import pandas as pd
 import numpy as np
+from tabulate import tabulate
 from tqdm import tqdm
 import torch
 from torch import nn
@@ -16,14 +18,16 @@ from accelerate.utils import set_seed
 from collections import defaultdict
 from torch.utils.data import DataLoader
 from copy import deepcopy
+import types
 
 from .word_retriever import PatchscopesRetriever
-from .representation_translator import LinearRepresentationTranslators
+from .representation_translator import LinearRepresentationTranslators, ProcrustesRepresentationTranslators, MLPRepresentationTranslators
 from .vocab_modifier import DetokenizationVocabularyExpander
 from .utils.file_utils import parse_string_list_from_file
-from .utils.data_utils import load_lm_dataset, extract_new_words_from_dataset, get_group_texts_func
+from .utils.data_utils import load_lm_dataset, extract_new_words_from_dataset, get_group_texts_func, get_tokenize_func
 from .utils.eval_utils import get_last_zero_in_every_seq_mask, get_first_zero_in_every_seq_mask, compute_topk_token_rank
 from .utils.eval_utils import count_tokens_in_dataset
+from .utils.early_exit_utils import get_early_exit_forward
 
 import logging
 
@@ -32,16 +36,35 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 logger = logging.getLogger(__name__)
 
 
+def _clip_overly_excited_new_logits(logits, vocab_size=32000, max_line=0.95, gamma=2.0, deletion_value=-10.0, **kwargs):
+    if logits.size(-1) == vocab_size:
+        return logits
+    logits = logits.clone()
+    new_logits = logits[..., vocab_size:]
+    orig_logits_topk = logits[..., :vocab_size].topk(new_logits.size(-1), dim=-1).values
+    orig_max_val = orig_logits_topk.max(-1, keepdims=True).values
+    new_max_val = new_logits.max(-1, keepdims=True).values
+    close_to_max_rate_orig = ((orig_logits_topk / orig_max_val) > max_line).to(torch.float32).mean(dim=-1)
+    close_to_max_rate_new = ((new_logits / orig_max_val) > max_line).to(torch.float32).mean(dim=-1)
+    # close_to_new_max_rate_new = ((new_logits / new_max_val) > max_line).to(torch.float32).mean(dim=-1)
+    over_excited_mask = close_to_max_rate_new >= gamma*close_to_max_rate_orig
+    updated_logits = logits[over_excited_mask]
+    updated_logits[:, vocab_size:] = deletion_value
+    logits[over_excited_mask] = updated_logits
+    return logits, over_excited_mask
+
+
 def eval_lm(
         model, accelerator, tokenizer, baseline_tokenizer, dataset,
-        batch_size: int = 8,
-        top_k: int = 5,
-        new_token_ids=None, replaced_token_seqs_by_len=None,
+        batch_size: int = 4,
+        top_ks=[5, 10],
+        new_token_ids=None, replaced_token_seqs_by_len=None, new_token_to_original_first_token=None,
         text_col_name: str = "text",
         max_length: int = 256,
         eval_max_samples: int = None,
+        clip_logits_kwargs: dict = None,
 ):
-
+    model.eval()
     if tokenizer.bos_token is not None and max_length:
         add_start_token = True
         # leave room for <BOS> token to be added:
@@ -50,31 +73,8 @@ def eval_lm(
         add_start_token = False
         max_tokenized_len = max_length
 
-    def tokenize_function(examples):
-        output = tokenizer(
-            examples[text_col_name],
-            return_token_type_ids=False,
-            add_special_tokens=False,
-            # padding=False,
-            # truncation=True if max_tokenized_len else False,
-            # max_length=max_tokenized_len,
-            # return_tensors="pt",
-            # return_attention_mask=True,
-        )
-        return output
-
-    def baseline_tokenize_function(examples):
-        output = baseline_tokenizer(
-            examples[text_col_name],
-            return_token_type_ids=False,
-            add_special_tokens=False,
-            # padding=False,
-            # truncation=True if max_tokenized_len else False,
-            # max_length=max_tokenized_len,
-            # return_tensors="pt",
-            # return_attention_mask=True,
-        )
-        return output
+    tokenize_function = get_tokenize_func(tokenizer, text_col_name)
+    baseline_tokenize_function = get_tokenize_func(baseline_tokenizer, text_col_name)
 
     column_names = dataset.column_names
 
@@ -123,19 +123,24 @@ def eval_lm(
     baseline_vocab_dataloader = DataLoader(
         baseline_lm_dataset, collate_fn=data_collator, batch_size=batch_size, drop_last=True, shuffle=False,
     )
-    model, expanded_vocab_dataloader, baseline_vocab_dataloader = accelerator.prepare(
-        model, expanded_vocab_dataloader, baseline_vocab_dataloader)
+    baseline_vocab_dataloader = accelerator.prepare(baseline_vocab_dataloader)
     model.eval()
 
     if new_token_ids is not None:
         new_token_ids = torch.tensor(new_token_ids).to(model.device)
     if replaced_token_seqs_by_len is not None:
         replaced_token_seqs_by_len = {token_length: torch.tensor(skip_token_seqs).to(model.device) for token_length, skip_token_seqs in replaced_token_seqs_by_len.items() if len(skip_token_seqs) > 0}
+    if new_token_to_original_first_token is not None:
+        # Convert the mapping into a tensor for efficient indexing, create a mapping tensor that defaults to identity
+        new_token_to_orig_first_mapping_tensor = torch.arange(len(tokenizer), device=model.device)
+        new_token_to_orig_first_mapping_tensor[torch.tensor(list(new_token_to_original_first_token.keys()), device=model.device)] = \
+            torch.tensor(list(new_token_to_original_first_token.values()), device=model.device)
 
     target_metrics = {
         "baseline": defaultdict(list),
         "expanded_E": defaultdict(list),
         "fully_expanded": defaultdict(list),
+        "clipped_expanded": defaultdict(list),
     }
 
     background_metrics = deepcopy(target_metrics)
@@ -143,57 +148,121 @@ def eval_lm(
     # for perplexity
     ce_loss_func = nn.CrossEntropyLoss(reduction="none")
 
+    # for clipping logits
+    if clip_logits_kwargs is None:
+        clip_logits_kwargs = dict()
+
     # TODO consider not aggregating results here, to enable metrics for specific words
-    def _compute_metrics(logits, labels, attention_mask, original_labels=None, compute_target_metrics=True, compute_subsequent_metrics=True):
+    def _compute_metrics(
+            model, tokenizer, logits, labels, attention_mask, original_labels=None,
+            compute_target_metrics=True, compute_subsequent_metrics=True, compute_perplexity=False,
+            clip_logits_kwargs=None,
+            debug=False):
+
+        target_results = dict()  # will hold metrics for all the new words we add or their original tokenization
         background_results = dict()  # will hold metrics for all background tokens, i.e., not the ones we add or replace
         if compute_subsequent_metrics:
             # prepare labels and attentions masks for computing metrics only for the 1st tokens following the new words
             subsequent_labels = labels[:,  1:]
             subsequent_attention_mask = get_last_zero_in_every_seq_mask(attention_mask[..., :-1].contiguous())
+            subsequent_attention_mask_bool = subsequent_attention_mask == 1
+        attention_mask_bool = attention_mask == 1
 
-        background_results["perplexity"] = torch.exp(
-            (ce_loss_func(logits.transpose(1, 2), labels) * attention_mask).sum(1)
-            / attention_mask.sum(1)
-        ).mean().detach().cpu().numpy()
-
-        top1 = logits.argmax(dim=-1)
-        background_results["top1_acc"] = (((
-                             labels == top1) * attention_mask).sum() / attention_mask.sum()).detach().cpu().numpy()
-        if compute_subsequent_metrics:
-            background_results["subsequent_top1_acc"] = (((subsequent_labels == top1[:, 1:]) * subsequent_attention_mask).sum() / subsequent_attention_mask.sum()).detach().cpu().numpy()
-
-        topk = logits.topk(top_k, dim=-1).indices
-        background_results["topk_acc"] = (((topk == labels.unsqueeze(-1)).any(
-            dim=-1) * attention_mask).sum() / attention_mask.sum()).detach().cpu().numpy()
-        if compute_subsequent_metrics:
-            background_results["subsequent_topk_acc"] = (((topk[:, 1:] == subsequent_labels.unsqueeze(-1)).any(
-                dim=-1) * subsequent_attention_mask).sum() / subsequent_attention_mask.sum()).detach().cpu().numpy()
-
-        rank = compute_topk_token_rank(logits, labels)
-        background_results["mrr"] = (((1 / rank) * attention_mask).sum() / attention_mask.sum()).detach().cpu().numpy()
-        if compute_subsequent_metrics:
-            background_results["subsequent_mrr"] = (((1 / rank[:,
-                                    1:]) * subsequent_attention_mask).sum() / subsequent_attention_mask.sum()).detach().cpu().numpy()
-        target_results = dict()  # will hold metrics for all the new words we add or their original tokenization
         if compute_target_metrics:
             target_mask = get_first_zero_in_every_seq_mask(attention_mask)
+            target_mask_bool = target_mask == 1
 
-            target_results["top1_acc"] = (((labels == top1) * target_mask).sum() / target_mask.sum()).detach().cpu().numpy()
+        if compute_perplexity:
+            background_results["perplexity"] = torch.exp(
+                (ce_loss_func(logits.transpose(1, 2), labels) * attention_mask).sum(1)
+                / attention_mask.sum(1)
+            ).mean().detach().cpu().numpy()
+
+        if clip_logits_kwargs is not None and clip_logits_kwargs["clip_new_logits"]:
+            logits, over_excited_mask = _clip_overly_excited_new_logits(
+                logits, **clip_logits_kwargs)
+
+        top1 = logits.argmax(dim=-1)
+
+        if compute_target_metrics:
+            target_results["top1_acc"] = ((labels == top1)[target_mask_bool]).detach().cpu().numpy()
             if original_labels is not None:  # TODO check target_mask is for the right token, and not the one after it
-                target_results["original_top1_acc"] = (
-                            ((original_labels == top1) * target_mask).sum() / target_mask.sum()).detach().cpu().numpy()
+                # target_results["original_top1_acc"] = (
+                #             (original_labels == top1)[target_mask_bool]).detach().cpu().numpy()
+                target_results["sum_top1_acc"] = (
+                    ((original_labels == top1) | (labels == top1))[target_mask_bool]).detach().cpu().numpy()
 
-            target_results["topk_acc"] = (((topk == labels.unsqueeze(-1)).any(
-                dim=-1) * target_mask).sum() / target_mask.sum()).detach().cpu().numpy()
+        background_results["top1_acc"] = ((
+                             labels == top1)[attention_mask_bool]).detach().cpu().numpy()
+        if compute_subsequent_metrics:
+            background_results["subsequent_top1_acc"] = ((subsequent_labels == top1[:, 1:])[subsequent_attention_mask_bool]).detach().cpu().numpy()
+        for top_k in top_ks:
+            topk = logits.topk(top_k, dim=-1).indices
+            background_results[f"top{top_k}_acc"] = ((topk == labels.unsqueeze(-1)).any(
+                dim=-1)[attention_mask_bool]).detach().cpu().numpy()
+            if compute_subsequent_metrics:
+                background_results[f"subsequent_top{top_k}_acc"] = ((topk[:, 1:] == subsequent_labels.unsqueeze(-1)).any(
+                    dim=-1)[subsequent_attention_mask_bool]).detach().cpu().numpy()
+            if compute_target_metrics:
+                target_results[f"top{top_k}_acc"] = ((topk == labels.unsqueeze(-1)).any(
+                    dim=-1)[target_mask_bool]).detach().cpu().numpy()
+                if original_labels is not None:
+                    # target_results[f"original_top{top_k}_acc"] = ((topk == original_labels.unsqueeze(-1)).any(
+                    #     dim=-1)[target_mask_bool]).detach().cpu().numpy()
+                    target_results[f"sum_top{top_k}_acc"] = (
+                        ((topk == original_labels.unsqueeze(-1)) | (topk == labels.unsqueeze(-1))).any(
+                        dim=-1)[target_mask_bool]).detach().cpu().numpy()
+
+        rank = compute_topk_token_rank(logits, labels)
+        background_results["mrr"] = ((1 / rank)[attention_mask_bool]).detach().cpu().numpy()
+        if compute_subsequent_metrics:
+            background_results["subsequent_mrr"] = ((1 / rank[:, 1:])[subsequent_attention_mask_bool]).detach().cpu().numpy()
+
+        if compute_target_metrics:
+            target_results["mrr"] = ((1 / rank)[target_mask_bool]).detach().cpu().numpy()
             if original_labels is not None:
-                target_results["original_topk_acc"] = (((topk == original_labels.unsqueeze(-1)).any(
-                dim=-1) * target_mask).sum() / target_mask.sum()).detach().cpu().numpy()
+                orig_rank = compute_topk_token_rank(logits, original_labels)
+                # target_results["original_mrr"] = ((1 / orig_rank)[target_mask_bool]).detach().cpu().numpy()
+                target_results["sum_mrr"] = ((1 / torch.minimum(orig_rank, rank))[target_mask_bool]).detach().cpu().numpy()
+        if debug:
+            clipped_logits, over_excited_mask = _clip_overly_excited_new_logits(logits)
+            top2 = clipped_logits.argmax(-1)
+            (labels == top1)[attention_mask_bool].to(float).mean()
+            (labels == top2)[attention_mask_bool].to(float).mean()
+            (subsequent_labels == top1[:, 1:])[subsequent_attention_mask_bool].to(float).mean()
+            (subsequent_labels == top2[:, 1:])[subsequent_attention_mask_bool].to(float).mean()
+            (labels == top1)[target_mask_bool].to(float).mean()
+            (labels == top2)[target_mask_bool].to(float).mean()
 
-            target_results["mrr"] = (((1 / rank) * target_mask).sum() / target_mask.sum()).detach().cpu().numpy()
-            if original_labels is not None:
-                rank = compute_topk_token_rank(logits, original_labels)
-                target_results["original_mrr"] = (((1 / rank) * target_mask).sum() / target_mask.sum()).detach().cpu().numpy()
+            top0 = logits[:, :, :32000].argmax(-1)
+            xx = (top1 != labels) & (top0 == labels) & attention_mask_bool
+            agree_xx = (top1 == labels) & (top0 == labels) & attention_mask_bool
+            xx_logits = logits[..., :32000][xx].topk(logits.shape[-1]-32000).values.detach().cpu().numpy()
+            xx_new_logits = logits[..., 32000:][xx].detach().cpu().numpy()
+            # i = 1; (xx_new_logits[i] / xx_logits[i].max() > 0.8).mean(); (xx_logits[i] / xx_logits[i].max() > 0.8).mean()
 
+            import pdb; pdb.set_trace()
+
+            # from .utils.logits_utils import weighted_distribution_matching, truncated_quantile_mapping, density_based_mapping
+            # from collections import Counter
+            # fails_to_predict = Counter()
+            # preceeds_failures = Counter()
+            # kde = truncated_quantile_mapping(xx_logits[1], xx_new_logits[1])
+            # tokenizer.batch_decode(labels[:, :][xx[:, :]])
+            # tokenizer.batch_decode(labels[:, :-1][xx[:, 1:]])
+            # tokenizer.batch_decode(top1[:, :][xx[:, :]])
+            # print("\n\n".join(tokenizer.batch_decode(labels)))
+            # fails_to_predict.update(labels[:, :][xx[:, :]].cpu().tolist())
+            # preceeds_failures.update(labels[:, :-1][xx[:, 1:]].cpu().tolist())
+            # logits2 = deepcopy(logits)
+            # logits2[:, :, 32000:] *= logits[:, :, :32000].std(dim=(0,1)).mean() / logits[:, :, 32000:].std(dim=(0, 1))
+            # top2 = logits2.argmax(-1)
+            # (top1 == labels)[attention_mask_bool].to(float).mean()
+            # (top2 == labels)[attention_mask_bool].to(float).mean()
+            # (top1 == labels)[target_mask_bool].to(float).mean()
+            # (top2 == labels)[target_mask_bool].to(float).mean()
+            # (top1[:, 1:] == subsequent_labels)[subsequent_attention_mask_bool].to(float).mean()
+            # (top2[:, 1:] == subsequent_labels)[subsequent_attention_mask_bool].to(float).mean()
         del rank
         return background_results, target_results
 
@@ -214,12 +283,11 @@ def eval_lm(
     def _add_start_token(batch):
         bos_tokens_tensor = torch.tensor([[tokenizer.bos_token_id]] * batch["input_ids"].size(dim=0)).to(batch["input_ids"].device)
         batch["input_ids"] = torch.cat([bos_tokens_tensor, batch["input_ids"]], dim=1)
-        batch["labels"] = torch.cat([bos_tokens_tensor, batch["labels"]], dim=1)
         batch["attention_mask"] = torch.cat(
             [torch.ones(bos_tokens_tensor.size(), dtype=torch.int64).to(batch["attention_mask"].device), batch["attention_mask"]], dim=1)
         return batch
 
-    def _ignore_new_words_in_attention_mask(shift_attention_mask_batch):
+    def _ignore_new_words_in_attention_mask(shift_attention_mask_batch, shift_labels):
         # Ignore token_ids of new vocabulary words in shift_labels and shift_logits
         if new_token_ids is not None:
             ignore_mask = torch.isin(shift_labels, new_token_ids)
@@ -251,6 +319,7 @@ def eval_lm(
 
         labels = batch["input_ids"]
         attn_mask = batch["attention_mask"]
+        batch.pop("labels")
         with torch.no_grad():
             outputs = model(**batch)
         out_logits = outputs.logits
@@ -259,21 +328,31 @@ def eval_lm(
         shift_labels = labels[..., 1:].contiguous()
         shift_attention_mask_batch = attn_mask[..., 1:].contiguous()
 
-        shift_attention_mask_batch, ignore_mask = _ignore_new_words_in_attention_mask(shift_attention_mask_batch)
+        shift_attention_mask_batch, ignore_mask = _ignore_new_words_in_attention_mask(shift_attention_mask_batch, shift_labels)
 
         # compute metrics for baseline vocabulary
         if new_token_ids is not None:
             # output vocab is expanded - to compute baseline, need to remove logits for new words
-            baseline_model_logits = torch.cat([shift_logits[:, :, :min(new_token_ids)], shift_logits[:, :, max(new_token_ids)+1:]], dim=-1)
+            shift_logits = torch.cat([shift_logits[:, :, :min(new_token_ids)], shift_logits[:, :, max(new_token_ids)+1:]], dim=-1)
         else:
-            baseline_model_logits = shift_logits
+            shift_logits = shift_logits
 
-        background_results, target_results = _compute_metrics(baseline_model_logits, shift_labels, shift_attention_mask_batch)
+        background_results, target_results = _compute_metrics(model, tokenizer, shift_logits, shift_labels, shift_attention_mask_batch, compute_perplexity=True)
         for metric_name, metric_value in target_results.items():
             target_metrics['baseline'][metric_name].append(metric_value)
         for metric_name, metric_value in background_results.items():
             background_metrics['baseline'][metric_name].append(metric_value)
 
+    baseline_vocab_dataloader = accelerator.free_memory(baseline_vocab_dataloader)
+
+
+    # import pdb; pdb.set_trace()
+    # batch = tokenizer("The results of this study are favorable", return_tensors="pt")
+    # batch["input_ids"] = batch["input_ids"].to(model.device); batch["attention_mask"] = batch["attention_mask"].to(model.device)
+    # with torch.no_grad(): x = model(**batch); xlogits = x.logits[0]; xtop1 = xlogits.argmax(dim=-1); tokenizer.decode(xtop1)
+    gc.collect()
+    torch.cuda.empty_cache()
+    expanded_vocab_dataloader = accelerator.prepare(expanded_vocab_dataloader)
     # metrics for expanded vocabulary
     for batch_i, batch in tqdm(enumerate(expanded_vocab_dataloader), total=len(expanded_vocab_dataloader),
                                miniters=10, desc="Evaluating expanded vocabulary..."):
@@ -282,6 +361,7 @@ def eval_lm(
 
         labels = batch["input_ids"]
         attn_mask = batch["attention_mask"]
+        batch.pop("labels")
         with torch.no_grad():
             outputs = model(**batch)
         out_logits = outputs.logits
@@ -290,48 +370,63 @@ def eval_lm(
         shift_labels = labels[..., 1:].contiguous()
         shift_attention_mask_batch = attn_mask[..., 1:].contiguous()
 
-        shift_attention_mask_batch, ignore_mask = _ignore_new_words_in_attention_mask(shift_attention_mask_batch)
-
-        # compute metrics for expanded vocabulary
-        if new_token_ids is not None:
-            # output vocab is expanded - to compute baseline, need to remove logits for new words
-            expanded_E_logits = torch.cat([shift_logits[:, :, :min(new_token_ids)], shift_logits[:, :, max(new_token_ids)+1:]], dim=-1)
-        else:
-            expanded_E_logits = shift_logits
-        background_results, _ = _compute_metrics(expanded_E_logits, shift_labels,
-                                                              shift_attention_mask_batch, compute_target_metrics=False)
-        for metric_name, metric_value in background_results.items():
-            background_metrics['expanded_E'][metric_name].append(metric_value)
-
-        fully_expanded_logits = shift_logits
-        # if new_token_ids is not None:
-        #     shift_logits = shift_logits[:, :, :-len(new_token_ids)]
-        #     shift_labels[ignore_mask] = tokenizer.bos_token_id
-
-        # TODO add original_labels - need map to apply over labels, to change new words to their original first subword token
-        background_results, target_results = _compute_metrics(fully_expanded_logits, shift_labels,
-                                                              shift_attention_mask_batch, original_labels=None)
+        shift_attention_mask_batch, ignore_mask = _ignore_new_words_in_attention_mask(shift_attention_mask_batch, shift_labels)
+        original_labels = None if new_token_to_original_first_token is None \
+            else new_token_to_orig_first_mapping_tensor[shift_labels]
+        background_results, target_results = \
+            _compute_metrics(model, tokenizer, shift_logits, shift_labels, shift_attention_mask_batch,
+                             original_labels=original_labels, debug=False)
         for metric_name, metric_value in target_results.items():
             target_metrics['fully_expanded'][metric_name].append(metric_value)
         for metric_name, metric_value in background_results.items():
             background_metrics['fully_expanded'][metric_name].append(metric_value)
 
+        if clip_logits_kwargs is not None and clip_logits_kwargs["clip_new_logits"]:
+            background_results, target_results = \
+                _compute_metrics(model, tokenizer, shift_logits, shift_labels, shift_attention_mask_batch,
+                                 original_labels=original_labels, debug=False, clip_logits_kwargs=clip_logits_kwargs)
+            for metric_name, metric_value in target_results.items():
+                target_metrics['clipped_expanded'][metric_name].append(metric_value)
+            for metric_name, metric_value in background_results.items():
+                background_metrics['clipped_expanded'][metric_name].append(metric_value)
+
+        if new_token_ids is not None:
+            # output vocab is expanded - to compute input-only expansion baseline, need to remove logits for new words
+            shift_logits = torch.cat(
+                [shift_logits[:, :, :min(new_token_ids)], shift_logits[:, :, max(new_token_ids) + 1:]], dim=-1)
+        else:
+            shift_logits = shift_logits
+        background_results, _ = _compute_metrics(model, tokenizer, shift_logits, shift_labels,
+                                                 shift_attention_mask_batch, compute_target_metrics=False)
+        _, target_results = _compute_metrics(model, tokenizer, shift_logits, original_labels,
+                                                 shift_attention_mask_batch, compute_target_metrics=True)
+        for metric_name, metric_value in background_results.items():
+            background_metrics['expanded_E'][metric_name].append(metric_value)
+        for metric_name, metric_value in target_results.items():
+            target_metrics['expanded_E'][metric_name].append(metric_value)
+
+        # if new_token_ids is not None:
+        #     shift_logits = shift_logits[:, :, :-len(new_token_ids)]
+        #     shift_labels[ignore_mask] = tokenizer.bos_token_id
+
         # for metric_name, metric_value in _compute_comparative_metrics(baseline_model_logits, fully_expanded_logits, shift_attention_mask_batch):
         #     metrics_per_example[metric_name].append(metric_value)
 
-
+    expanded_vocab_dataloader = accelerator.free_memory(expanded_vocab_dataloader)
+    gc.collect()
+    torch.cuda.empty_cache()
     for eval_type in target_metrics.keys():
-        target_metrics[eval_type] = {k: np.nanmean(v) for k, v in target_metrics[eval_type].items()}
+        target_metrics[eval_type] = {metric: np.nanmean(np.concatenate([np.atleast_1d(v) for v in results_list])) for metric, results_list in target_metrics[eval_type].items()}
     for eval_type in background_metrics.keys():
-        background_metrics[eval_type] = {k: np.nanmean(v) for k, v in background_metrics[eval_type].items()}
+        background_metrics[eval_type] = {metric: np.nanmean(np.concatenate([np.atleast_1d(v) for v in results_list])) for metric, results_list in background_metrics[eval_type].items()}
 
-    other_metircs = {
+    other_metrics = {
         "total_tokens": {
             "baseline": baseline_vocab_total_tokens,
-            "expanded": expanded_vocab_total_tokens,
+            "expanded": new_vocab_total_tokens,
         },
     }
-    return background_metrics, target_metrics, other_metircs
+    return background_metrics, target_metrics, other_metrics
 
 
 def get_word_filter(args):
@@ -369,9 +464,19 @@ def prepare_new_words(
         if args.words_dataset_max_samples:
             words_dataset = words_dataset.select(range(args.words_dataset_max_samples))
 
-        new_words += extract_new_words_from_dataset(
+        new_words_from_data, new_words_from_data_freqs = extract_new_words_from_dataset(
             words_dataset, tokenizer, args.words_dataset_text_col, filter_func=_word_filter)
 
+    if args.words_filter_min_freq is not None:
+            new_words_from_data = [word for word in new_words_from_data if new_words_from_data_freqs[word] >= args.words_filter_min_freq]
+
+    topline_tokenizer = deepcopy(tokenizer)
+    n_new_words = topline_tokenizer.add_tokens(new_words_from_data)
+    baseline_vocab_total_tokens = count_tokens_in_dataset(words_dataset, tokenizer, args.words_dataset_text_col)
+    max_vocab_total_tokens = count_tokens_in_dataset(words_dataset, topline_tokenizer, args.words_dataset_text_col)
+    logger.info(f"Baseline tokenizer - total tokens: {baseline_vocab_total_tokens}")
+    logger.info(f"Topline expanded tokenizer - total tokens: {max_vocab_total_tokens} - new words: {n_new_words}")
+    new_words += new_words_from_data
     baseline_tokenization = {w: tokenizer.encode(w, add_special_tokens=False, return_tensors="pt")[0]
                              for w in new_words}
 
@@ -383,7 +488,7 @@ def prepare_patchscopes_retriever(args, model, tokenizer):
         model, tokenizer,
         args.extraction_prompt,
         args.patchscopes_prompt,
-        args.patchscopes_prompt_target,
+        args.prompt_target,
         num_tokens_to_generate=args.patchscopes_generate_n_tokens,
     )
 
@@ -398,11 +503,36 @@ def prepare_translators(args, model, tokenizer):
 
     if args.translators_path:
         translators = torch.load(args.translators_path, map_location=torch.device('cpu'))
-    else:
-        translators = LinearRepresentationTranslators()
+    elif args.translators_use_procrustes:
+        translators = ProcrustesRepresentationTranslators()
         translators.fit_on_tokens(
             model, tokenizer,
             prompt=args.extraction_prompt,
+            prompt_target=args.prompt_target,
+            translation_layers=args.translators_procrustes_layers,
+            normalize=args.translators_procrustes_normalize,
+            batch_size=args.extraction_batch_size,
+            space_prefixed_only=args.translators_learn_on_space_prefixed_words_only,
+            min_word_len=args.translators_fit_min_word_len,
+        )
+    elif args.translators_learn_mlp:
+        translators = MLPRepresentationTranslators()
+        translators.fit_on_tokens(
+            model, tokenizer,
+            prompt=args.extraction_prompt,
+            prompt_target=args.prompt_target,
+            batch_size=args.extraction_batch_size,
+        )
+    else:
+        translators = LinearRepresentationTranslators(do_residual=args.translators_do_residual)
+        translators.fit_on_tokens(
+            model, tokenizer,
+            prompt=args.extraction_prompt,
+            prompt_target=args.prompt_target,
+            batch_size=args.extraction_batch_size,
+            fit_intercept=args.translators_fit_intercept,
+            space_prefixed_only=args.translators_learn_on_space_prefixed_words_only,
+            min_word_len=args.translators_fit_min_word_len,
         )
 
     return translators
@@ -415,8 +545,16 @@ def main(args):
     os.makedirs(output_dir, exist_ok=True)
 
     logger.info("Loading model...")
-    accelerator = Accelerator(mixed_precision="bf16" if torch.cuda.is_bf16_supported() else "fp16")
-    model = AutoModelForCausalLM.from_pretrained(args.model_name)
+    mixed_precision = "bf16" if torch.cuda.is_bf16_supported() else "fp16"
+    accelerator = Accelerator(mixed_precision=mixed_precision)
+    model = AutoModelForCausalLM.from_pretrained(args.model_name, torch_dtype=torch.bfloat16 if mixed_precision == "bf16" else torch.float16)
+
+    if args.early_exit_layer is not None:
+        model.model.forward = types.MethodType(
+            get_early_exit_forward(exit_layer=args.early_exit_layer), model.model
+        )
+        model.config.num_hidden_layers = args.early_exit_layer
+
     model = accelerator.prepare(model)
     tokenizer = AutoTokenizer.from_pretrained(args.model_name)
     baseline_tokenizer = AutoTokenizer.from_pretrained(args.model_name)
@@ -431,12 +569,118 @@ def main(args):
     # new_words = new_words[:100]
 
     logger.info("Running patchscopes on new words...")
-    patchscopes_retriever, patchscopes_results = prepare_patchscopes_retriever(args, model, tokenizer)
+    patchscopes_retriever, patchscopes_results = prepare_patchscopes_retriever(args, model, baseline_tokenizer)
 
     logger.info("Preparing transformations to embedding and unembedding spaces...")
     translators = prepare_translators(args, model, tokenizer)
     if not args.translators_path:
         torch.save(translators, os.path.join(output_dir, "translators.pt"))
+
+    # from .utils.model_utils import extract_vocab_hidden_states, extract_token_i_hidden_states
+    # import torch.nn.functional as F
+    # from .utils.procrustes.orthogonal import orthogonal as orthogonal_procrustes
+    # # from .utils.procrustes.rotational import rotational as rotational_procrustes
+    # # from .utils.procrustes.symmetric import symmetric as symmetric_procrustes
+    # vocab_h = extract_vocab_hidden_states(model, tokenizer)
+    # embedding = model.get_input_embeddings().weight.data.cpu().to(torch.float32)
+    # lm_head = model.get_output_embeddings().weight.data.cpu().to(torch.float32)
+    # layer_i = 4
+    # vocab_layer_h = vocab_h[layer_i].cpu().to(torch.float32)
+    # # norm_h = (curr_vocab_h - bias_h).std(-1)
+    # # norm_h = torch.norm(vocab_layer_h, p=2, dim=-1).unsqueeze(1)
+    # # norm_u = torch.norm(lm_head, p=2, dim=-1).unsqueeze(1)
+    # # curr_vocab_h = (vocab_layer_h - vocab_layer_h.mean(-1).unsqueeze(1)) / vocab_layer_h.std(-1).unsqueeze(1)
+    # sd_u = lm_head.std(-1).mean()
+    # bias_h = vocab_layer_h.mean(dim=0)
+    # bias_u = lm_head.mean(dim=0)
+    # bias_e = embedding.mean(dim=0)
+    # # curr_u = (lm_head - lm_head.mean(-1).unsqueeze(1)) / lm_head.std(-1).unsqueeze(1)
+    # # curr_vocab_h = (vocab_layer_h) / vocab_layer_h.std(-1).unsqueeze(1)
+    # # curr_u = (lm_head) / lm_head.std(-1).unsqueeze(1)
+    # curr_u = lm_head - bias_u  # bias_u is critical! only needed during training, re-adding it inference hurts performance
+    # curr_e = embedding - bias_e  # bias_u is critical! only needed during training, re-adding it inference hurts performance
+    # # curr_u = (curr_u - curr_u.mean(-1).unsqueeze(1)) / curr_u.std(-1).unsqueeze(1)  # trying this, not sure about its effect
+    # # curr_u = (curr_u) / curr_u.std(-1).unsqueeze(1)  # trying this, not sure about its effect
+    # curr_vocab_h = (vocab_layer_h - bias_h) # remove bias_h when fitting, but don't use it during inference - puts the distribution next to all the weird tokens
+    # # curr_vocab_h = (curr_vocab_h - curr_vocab_h.mean(-1).unsqueeze(1)) / curr_vocab_h.std(-1).unsqueeze(1)
+    # # curr_vocab_h = (curr_vocab_h) / curr_vocab_h.std(-1).unsqueeze(1)
+    #
+    # # curr_vocab_h = (curr_vocab_h - bias_h) / curr_vocab_h.std(-1).unsqueeze(1)
+    #
+    # # proc = orthogonal_procrustes((curr_vocab_h - bias_h).numpy(), (lm_head - bias_u).numpy(), lapack_driver="gesdd", scale=False, translate=False)
+    # # "scale" parameter in procrustes doesn't matter
+    # proc = orthogonal_procrustes((curr_vocab_h).numpy(), (curr_u).numpy(), lapack_driver="gesdd", scale=False, translate=False)
+    # procc_u = torch.tensor(proc.t.T, dtype=torch.float)
+    # proc = orthogonal_procrustes((curr_vocab_h).numpy(), (curr_e).numpy(), lapack_driver="gesdd", scale=False, translate=False)
+    # procc_e = torch.tensor(proc.t.T, dtype=torch.float)
+    # e2u = orthogonal_procrustes((curr_e).numpy(), (curr_u).numpy(), lapack_driver="gesdd", scale=False, translate=False)
+    # e2u = torch.tensor(e2u.t.T, dtype=torch.float)
+
+    # intercept = (curr_u - (curr_vocab_h @ procc)).mean(0)
+
+    # from sklearn.linear_model import LinearRegression
+    # lreg = LinearRegression(fit_intercept=False).fit((curr_vocab_h).numpy(), (curr_u).numpy())
+    # procc = torch.tensor(lreg.coef_.T, dtype=torch.float)
+    # proc = orthogonal_procrustes((curr_vocab_h).numpy(), (lm_head - bias_u).numpy(), lapack_driver="gesdd", scale=False, translate=False)
+    # proc = orthogonal_procrustes(curr_vocab_h.numpy(), (lm_head - bias_u).numpy(), lapack_driver="gesdd", scale=False, translate=False)
+    # proc = orthogonal_procrustes((curr_vocab_h - bias_h).numpy()/vocab_fro.numpy(), (lm_head - bias_u).numpy()/lm_head_fro.numpy(), lapack_driver="gesdd", scale=False, translate=False)
+    # proc = orthogonal_procrustes((curr_vocab_h - bias_h).numpy()/norm_h.numpy(), (lm_head - bias_u).numpy()/norm_u.numpy(), lapack_driver="gesdd", scale=False, translate=False)
+    # proc = orthogonal_procrustes(curr_vocab_h.numpy(), (embedding - bias_u).numpy(), lapack_driver="gesdd", scale=False, translate=False)
+    # procc = torch.tensor(proc.t.T, dtype=torch.float)
+    # curr_vocab_h = ((curr_vocab_h - bias_h) / norm_h.unsqueeze(1))
+    #
+    # import pdb; pdb.set_trace()
+    # # # bias = (vocab_h[layer_i] @ procc - lm_head).mean(axis=0)
+    # # # proc = orthogonal_procrustes(vocab_h[layer_i].numpy(), lm_head.numpy(), lapack_driver="gesdd")
+    # # # proc = orthogonal_procrustes(curr_vocab_h.numpy(), lm_head.numpy(), lapack_driver="gesdd", scale=False, translate=False)
+    # # # proc = orthogonal_procrustes((curr_vocab_h - bias_h).numpy(), (lm_head - bias_u).numpy(), lapack_driver="gesdd", scale=False, translate=False)
+    # # # proc = orthogonal_procrustes((curr_vocab_h.cpu().to(torch.float32) - bias_h).numpy(), (lm_head.repeat((6, 1)) - bias_u).numpy(), lapack_driver="gesdd", scale=False, translate=False)
+    # #
+    # # hello_idx = 13406; hello_h = vocab_h[layer_i][hello_idx]; hello_e = embedding[hello_idx]; hello_u = lm_head[hello_idx]
+    # # desc, word_h = patchscopes_retriever.get_hidden_states_and_retrieve_word("Bonaparte")
+    # desc, word_h = patchscopes_retriever.get_hidden_states_and_retrieve_word("grenadier")
+    # # # y_u = (procc @ (hello_h - hello_h.mean())/hello_h.std() + bias_u)
+    # # y_u = (procc @ ((hello_h - hello_h.mean())/hello_h.std())) * hello_h.std()
+    # # y_u = (procc @ ((hello_h - hello_h.mean())/hello_h.std())) * sd_u
+    #
+    # # this is better to soften the output probabilities, make them more reasonable ((sd_u / hello_h.std()))
+    # hello_h = word_h[3]
+    # # y_u = (procc @ ((hello_h - hello_h.mean())/hello_h.std())) * (sd_u / hello_h.std())
+    # # y_u = (procc @ ((hello_h - hello_h.mean())/hello_h.std())) * sd_u
+    # # y_u = (procc @ ((hello_h - hello_h.mean())/hello_h.std())) * sd_u
+    # # y_u = (procc @ ((hello_h)/hello_h.std())) * (sd_u / hello_h.std())
+    # y_u = (procc @ (hello_h))
+    # y_e = (procc @ (hello_h))
+    # y_u = (e2u @ y_e)
+    # x = lm_head.to(torch.float32) @ (y_u); print(x.topk(10).values); tokenizer.batch_decode(x.topk(40).indices)
+    # x = embedding.to(torch.float32) @ (y_e); print(x.topk(10).values); tokenizer.batch_decode(x.topk(40).indices)
+
+    # y_u = (procc @ (hello_h/hello_h.std())) * (sd_u / hello_h.std())
+    # mean_norn_u = torch.norm(lm_head, p=2, dim=-1).mean()
+    # renorm = mean_norn_u / torch.norm(y_u, p=2)
+    # y_u = y_u * renorm
+    # y_u = (procc @ ((hello_h - hello_h.mean())/hello_h.std()) + bias_u) * hello_h.std()
+    # # y_u = (procc @ ((hello_h)/hello_h.std()) + bias_u) * hello_h.std()
+    # # y_u = ((procc @ (hello_h))/hello_h.std() + bias_u) * hello_h.std()
+    # y_u = (procc @ (hello_h - bias_h)/vocab_fro + bias_u)*lm_head_fro
+    # y_u = (procc @ (hello_h - bias_h)/torch.norm((hello_h), p=2)*norm_u.mean() + bias_u)
+    # # y_u = (procc @ (hello_h - bias_h)/hello_h.std() + bias_u) * hello_h.std()
+
+    # x = embedding.to(torch.float32) @ y_u;
+
+    # # y_u = procc @ (hello_h - bias_h)
+    # # y_u = procc @ (hello_h - bias_h) + bias_u
+    #
+    #
+    # # y_u = procc @ hello_h + bias
+    # # y_u = procc @ hello_h + bias - bias2
+    # # y_u = translators.to_lm_head(hello_h, layer_i)
+    # # y_u = translators.to_embedding(hello_h, 2)
+    #
+    # # tokenizer.batch_decode(x_gold.topk(10).indices)
+    # # y_e = translators.to_embedding(hello_h, layer_i)
+    # # F.cosine_similarity(hello_u.float(), y_u.float(), dim=0)
+    # # F.mse_loss(hello_u.float(), y_u.float())
 
     logger.info("Adding new words to model vocabulary...")
     model.eval()
@@ -445,16 +689,20 @@ def main(args):
         patchscopes_retriever, patchscopes_results,
         translators,
         args.detokenization_decision_rule,
+        args.detokenization_decision_rule_E,
+        args.detokenization_max_valid_layer,
         add_to_core_vocab=args.add_new_words_to_core_vocab,
         add_space_before_lowercase_word=args.add_space_before_lowercase_words,
+        early_exit_layer=args.early_exit_layer,
     )
-    vocab_modifier.add_words_to_vocab(new_words)
-    tokenizer = vocab_modifier.tokenizer
+    model, tokenizer = vocab_modifier.add_words_to_vocab(new_words)
+
     logger.info("Done adding words! Patchscopes success rate: "
                 f"{len(vocab_modifier.new_words) / (len(vocab_modifier.new_words) + len(vocab_modifier.failed_words))}")
-    logger.info("Saving updated patchscopes cache to file...")
+
     updated_patchscopes_results = vocab_modifier.get_patchscopes_results()
     if patchscopes_results is None or len(updated_patchscopes_results) > len(patchscopes_results):
+        logger.info("Saving updated patchscopes cache to file...")
         patchscopes_results = updated_patchscopes_results
         if args.patchscopes_results_cache:
             patchscopes_results.to_parquet(args.patchscopes_results_cache)
@@ -462,21 +710,41 @@ def main(args):
             patchscopes_results.to_parquet(
                 os.path.join(output_dir, "patchscopes_results.parquet"))
 
+    # vocab_modifier.free_memory()
+    del patchscopes_results
+    gc.collect()
+    torch.cuda.empty_cache()
+
     # compute metrics
     eval_dataset = load_lm_dataset(args.eval_dataset, args.eval_dataset_language)
     eval_dataset = eval_dataset[args.eval_dataset_split]
 
+    new_tokens_to_replaced_token_seqs = vocab_modifier.get_new_tokens_to_replaced_token_seqs_map()
+    seq_lens = {len(v) for v in new_tokens_to_replaced_token_seqs.values()}
+    replaced_token_seqs_by_len = {curr_seq_len: [seq for seq in new_tokens_to_replaced_token_seqs.values() if len(seq) == curr_seq_len] for curr_seq_len in seq_lens}
+    new_token_to_original_first_token = {k: v[0] for k, v in new_tokens_to_replaced_token_seqs.items()}
     background_metrics, target_metrics, other_metrics = eval_lm(
         model, accelerator, tokenizer, baseline_tokenizer, eval_dataset,
-        batch_size=8, top_k=5, new_token_ids=vocab_modifier.new_token_ids, replaced_token_seqs_by_len=None,
-        eval_max_samples=args.eval_max_samples)
+        batch_size=4, top_ks=[5, 10], new_token_ids=vocab_modifier.new_token_ids,
+        replaced_token_seqs_by_len=replaced_token_seqs_by_len,
+        new_token_to_original_first_token=new_token_to_original_first_token,
+        eval_max_samples=args.eval_max_samples, text_col_name=args.eval_dataset_text_col,
+        clip_logits_kwargs={
+            "clip_new_logits": args.clip_new_logits, "vocab_size": len(baseline_tokenizer), "max_line": args.clip_max_line,
+            "gamma": args.clip_gamma}
+    )
+
+    other_metrics["n_new_words"] = len(vocab_modifier.new_words)
+    other_metrics["patchscopes_success_rate"] = len(vocab_modifier.new_words) / (len(vocab_modifier.new_words) + len(vocab_modifier.failed_words))
+    other_metrics["tokens_saved"] = 1 - other_metrics["total_tokens"]["expanded"] / other_metrics["total_tokens"]["baseline"]
+    other_metrics["n_attempted_words"] = len(new_words)
 
     print(other_metrics)
     background_df = pd.DataFrame.from_dict(background_metrics)
     target_df = pd.DataFrame.from_dict(target_metrics)
     other_df = pd.DataFrame.from_dict(other_metrics)
-    print(background_df)
-    print(target_df)
+    print(tabulate(background_df, headers='keys', tablefmt='psql'))
+    print(tabulate(target_df, headers='keys', tablefmt='psql'))
     background_df.to_json(os.path.join(output_dir, "metrics_background.json"), indent=4)
     target_df.to_json(os.path.join(output_dir, "metrics_target.json"), indent=4)
     other_df.to_json(os.path.join(output_dir, "metrics_other.json"), indent=4)
@@ -499,17 +767,30 @@ def parse_args():
     parser.add_argument("--add_new_words_to_core_vocab", action="store_true", default=False)
     parser.add_argument("--add_space_before_lowercase_words", action="store_true", default=False)
     parser.add_argument("--detokenization_decision_rule", type=str, default="first_id_layer")
+    parser.add_argument("--detokenization_decision_rule_E", type=str, default=None)
+    parser.add_argument("--detokenization_max_valid_layer", type=int, default=None)
+    parser.add_argument("--early_exit_layer", type=int, default=None)
     parser.add_argument("--extraction_prompt", type=str, default="X")
     parser.add_argument("--patchscopes_prompt", type=str, default="X, X, X, X,")
-    parser.add_argument("--patchscopes_prompt_target", type=str, default="X")
+    parser.add_argument("--prompt_target", type=str, default="X")
     parser.add_argument("--patchscopes_results_cache", type=str, default=None)
     parser.add_argument("--patchscopes_generate_n_tokens", type=int, default=20)
     parser.add_argument("--patchscopes_max_words", type=int, default=None)
+    parser.add_argument("--extraction_batch_size", type=int, default=128)
     parser.add_argument("--translators_path", type=str, default=None)
+    parser.add_argument("--translators_fit_intercept", action="store_true", default=False)
+    parser.add_argument("--translators_do_residual", action="store_true", default=False)
+    parser.add_argument("--translators_learn_mlp", action="store_true", default=False)
+    parser.add_argument("--translators_use_procrustes", action="store_true", default=False)
+    parser.add_argument("--translators_procrustes_normalize", action="store_true", default=False)
+    parser.add_argument("--translators_procrustes_layers", nargs="+", type=int, default=None)
+    parser.add_argument("--translators_learn_on_space_prefixed_words_only", action="store_true", default=False)
+    parser.add_argument("--translators_fit_min_word_len", type=int, default=None)
     parser.add_argument("--eval_dataset", type=str, default="wikitext")
     parser.add_argument("--eval_dataset_language", type=str, default=None)
     parser.add_argument("--eval_max_samples", type=int, default=None)
     parser.add_argument("--eval_dataset_split", type=str, default="test")
+    parser.add_argument("--eval_dataset_text_col", type=str, default="text")
     parser.add_argument("--words_dataset", type=str, default=None)
     parser.add_argument("--words_dataset_language", type=str, default=None)
     parser.add_argument("--words_dataset_max_samples", type=int, default=None)
@@ -517,9 +798,13 @@ def parse_args():
     parser.add_argument("--words_dataset_text_col", type=str, default="text")
     parser.add_argument("--words_list", type=str, default=None)
     parser.add_argument("--words_list_delimiter", type=str, default=None)
+    parser.add_argument("--words_filter_min_freq", type=int, default=None)
     parser.add_argument("--words_filter_max_n_tokens", type=int, default=5)
     parser.add_argument("--words_filter_non_en", action="store_true", default=False)
     parser.add_argument("--words_filter_numeric", action="store_true", default=False)
+    parser.add_argument("--clip_new_logits", action="store_true", default=True)
+    parser.add_argument("--clip_max_line", type=float, default=0.95)
+    parser.add_argument("--clip_gamma", type=float, default=2.0)
     parser.add_argument("--output_dir", type=str, default="./experiments/")
 
     args = parser.parse_args()

@@ -1,10 +1,29 @@
 import re
-from datasets import load_dataset, Dataset
+from datasets import load_dataset, Dataset, DatasetDict
 from itertools import chain
 from tqdm import tqdm
+from collections import Counter
 
 LANGUAGES_TO_DECODE_FROM_BYTES = ["he"]
 STREAMING_DATASETS = ["fineweb-edu"]
+
+
+def load_pg19_val_and_test():
+    # Load the dataset in streaming mode
+    streaming_dataset = load_dataset("deepmind/pg19", split=None, streaming=True)
+
+    # Extract test and validation splits
+    test_split = list(streaming_dataset["test"])
+    validation_split = list(streaming_dataset["validation"])
+
+    # Convert them into regular datasets
+    test_dataset = Dataset.from_list(test_split)
+    validation_dataset = Dataset.from_list(validation_split)
+
+    # validation_dataset = load_dataset("deepmind/pg19", split="validation")
+    # test_dataset = load_dataset("deepmind/pg19", split="test")
+
+    return DatasetDict({"validation": validation_dataset, "test": test_dataset})
 
 
 def load_lm_dataset(dataset_name, language="en", split=None):
@@ -32,7 +51,7 @@ def load_lm_dataset(dataset_name, language="en", split=None):
     elif dataset_name.lower() == 'wikitext-103':
         return load_dataset("Salesforce/wikitext", "wikitext-103-raw-v1", split=split)
     elif dataset_name.lower() == 'pg19':
-        return load_dataset("deepmind/pg19", split=split)
+        return load_pg19_val_and_test()
     elif dataset_name.lower() == 'wiki40b':
         dataset = load_dataset("google/wiki40b", language, split=split)
         if language in LANGUAGES_TO_DECODE_FROM_BYTES:
@@ -74,16 +93,20 @@ def extract_new_words_from_dataset(
         words = word_pattern.findall(text)
         all_words += words
 
-    all_words = list(dict.fromkeys(all_words))
+    # all_words = list(dict.fromkeys(all_words))
+    word_frequencies = Counter(all_words)
+    all_words = list(word_frequencies.keys())
     token_counts = [len(x) for x in tokenizer(all_words, add_special_tokens=False)["input_ids"]]
     w_whitespace_token_counts = [len(x) for x in tokenizer([f" {w}" for w in all_words], add_special_tokens=False)["input_ids"]]
+
     new_words = [word for word, count, w_whitespace_count in zip(all_words, token_counts, w_whitespace_token_counts) if ((count > 1) and (w_whitespace_count > 1) and filter_func(word, count))]
+    new_words_freq = {word: word_frequencies[word] for word in new_words}
     # for word, token_count in tqdm(all_words, total=len(all_words), miniters=10, desc="Finding new words...", unit="words"):
     #     if (not tokenizer.vocab.get(word, False)) and :
     #         new_words.append(word)
 
     # remove duplicates and return
-    return new_words
+    return new_words, new_words_freq
 
 
 # def get_words_in_dataset_by_token_length(data, tokenizer, remove_breaks=False, filter_func=lambda: True):
@@ -134,3 +157,14 @@ def get_group_texts_func(block_size=1024):
         result["labels"] = result["input_ids"].copy()
         return result
     return group_texts
+
+
+def get_tokenize_func(tokenizer, text_col_name):
+    def _tokenize(examples):
+        output = tokenizer(
+            examples[text_col_name],
+            return_token_type_ids=False,
+            add_special_tokens=False,
+        )
+        return output
+    return _tokenize

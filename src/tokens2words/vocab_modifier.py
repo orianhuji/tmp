@@ -11,6 +11,7 @@ from collections import defaultdict
 from typing import DefaultDict
 import tempfile
 import json
+from copy import deepcopy
 
 from .representation_translator import RepresentationTranslators
 from .word_retriever import PatchscopesRetriever
@@ -25,6 +26,7 @@ class VocabularyModifier(ABC):
             self,
             model: PreTrainedModel,
             tokenizer: PreTrainedTokenizer,
+            base_tokenizer: PreTrainedTokenizer = None,
             add_to_core_vocab: bool = True,
             add_space_before_lowercase_words: bool = False,
             space_token: str = "Ġ",
@@ -32,6 +34,7 @@ class VocabularyModifier(ABC):
     ):
         self.model = model
         self.tokenizer = tokenizer
+        self.base_tokenizer = base_tokenizer if base_tokenizer is not None else deepcopy(tokenizer)
 
         self.add_to_core_vocab = add_to_core_vocab
         self.add_space_before_lowercase_words = add_space_before_lowercase_words
@@ -42,7 +45,11 @@ class VocabularyModifier(ABC):
         self.new_token_ids: List[int] = list()
         self.new_words: List[str] = list()
         self.failed_words: List[str] = list()
-        self.entries_cache = {"embedding": list(), "lm_head": list()}
+        self.entries_cache = {"embedding": dict(), "lm_head": dict()}
+
+    @abstractmethod
+    def free_memory(self) -> None:
+        pass
 
     @abstractmethod
     def compute_entries_for_word(
@@ -95,14 +102,12 @@ class VocabularyModifier(ABC):
             word = self.space_token + word
 
         # Add new word to the tokenizer
-        if self.add_to_core_vocab:
-            num_added_tokens = int(word not in self.tokenizer.get_vocab())
-        else:
-            num_added_tokens = self.tokenizer.add_tokens([word])
+        num_added_tokens = int(word not in self.tokenizer.get_vocab() and (len(self.tokenizer.tokenize(word)) != 1))
 
         if num_added_tokens > 0:  # don't add word if it already exists
             self.new_words.append(word)
             if finalize:
+                self.tokenizer.add_tokens([word])
                 self.model.resize_token_embeddings(len(self.tokenizer) + num_added_tokens)
                 new_token_idx = len(self.tokenizer) - 1
                 if self.add_to_core_vocab:
@@ -111,34 +116,42 @@ class VocabularyModifier(ABC):
 
                 with torch.no_grad():
                     self.model.get_input_embeddings().weight[new_token_idx] = embedding_entry
-                    self.model.lm_head.weight[new_token_idx] = lm_head_entry
+                    self.model.get_output_embeddings().weight[new_token_idx] = lm_head_entry
             else:
-                self.entries_cache["embedding"].append(embedding_entry)
-                self.entries_cache["lm_head"].append(lm_head_entry)
+                self.entries_cache["embedding"][word] = embedding_entry
+                self.entries_cache["lm_head"][word] = lm_head_entry
 
     def add_words_to_vocab(
             self, words: Iterable[str]
-    ) -> None:
+    ):
         for word in tqdm(words, total=len(words), desc="Adding words to vocabulary...", unit="word"):
             self.add_word_to_vocab(word, finalize=False)
 
         self.new_token_ids = list(range(self.orig_vocab_size, self.orig_vocab_size+len(self.new_words)))
         if self.add_to_core_vocab:
             self.add_words_to_core_vocab(self.new_words, self.new_token_ids)
-        
-        self.model.resize_token_embeddings(len(self.tokenizer) + len(self.new_words))
+        else:
+            for word in self.new_words:
+                self.tokenizer.add_tokens([word])
 
-        for new_token_idx, word, embedding_entry, lm_head_entry in zip(
+        self.model.resize_token_embeddings(len(self.base_tokenizer) + len(self.new_words))
+        if self.add_to_core_vocab:
+            pass  # TODO adjust for direct editing of tokenizer
+
+        for new_token_idx, word in zip(
                 self.new_token_ids,
                 self.new_words,
-                self.entries_cache["embedding"],
-                self.entries_cache["lm_head"]
             ):
             with torch.no_grad():
-                self.model.get_input_embeddings().weight[new_token_idx] = embedding_entry
-                self.model.lm_head.weight[new_token_idx] = lm_head_entry
+                self.model.get_input_embeddings().weight[new_token_idx] = self.entries_cache["embedding"][word]
+                self.model.get_output_embeddings().weight[new_token_idx] = self.entries_cache["lm_head"][word]
+        self.entries_cache = {"embedding": dict(), "lm_head": dict()}
 
-        self.entries_cache = {"embedding": list(), "lm_head": list()}
+        return self.model, self.tokenizer
+
+    def get_new_tokens_to_replaced_token_seqs_map(self):
+        return {token_id: self.base_tokenizer.encode(word, add_special_tokens=False)
+                for word, token_id in zip(self.new_words, self.new_token_ids)}
 
 
 class DetokenizationVocabularyExpander(VocabularyModifier):
@@ -154,22 +167,35 @@ class DetokenizationVocabularyExpander(VocabularyModifier):
             patchscopes_results: Union[np.ndarray, pd.DataFrame, Dict[str, Dict[int, str]]] = None,
             translators: RepresentationTranslators = None,
             detokenization_decision_rule: str = "first_id_layer",
+            detokenization_decision_rule_E: str = None,
+            max_valid_layer: int = None,
+            early_exit_layer: int = None,
             **kwargs
     ):
         super().__init__(model, tokenizer, **kwargs)
 
         self.detokenization_decision_rule = detokenization_decision_rule
+        self.detokenization_decision_rule_E = detokenization_decision_rule_E
+        self.max_valid_layer = max_valid_layer
+        self.early_exit_layer = early_exit_layer
 
         self.patchscopes_retriever = patchscopes_retriever
         self.patchscopes_results = patchscopes_results
-        if not patchscopes_results:
+        if patchscopes_results is None:
             # create dict that maps new words (str) to a list of their patchscopes output per layer
             self.patchscopes_results: DefaultDict[str, List[str]] = defaultdict(list)
 
         self.translators = translators
 
-    def _decide_detokenization_end_layer(self, word: str, patchscopes_results: Iterable[str]):
-        patchscopes_results = np.array(patchscopes_results)
+    def free_memory(self) -> None:
+        del self.patchscopes_results
+        del self.translators
+
+    def _decide_detokenization_end_layer(self, word: str, patchscopes_results: Iterable[str], decision_rule=None):
+        decision_rule = self.detokenization_decision_rule if decision_rule is None else decision_rule
+        patchscopes_results = np.array(patchscopes_results).astype(str)
+        if self.early_exit_layer is not None:
+            patchscopes_results = patchscopes_results[:self.early_exit_layer]
 
         # Check if each layer's result starts with the word
         patchscopes_results = np.char.strip(patchscopes_results)
@@ -184,18 +210,37 @@ class DetokenizationVocabularyExpander(VocabularyModifier):
         if np.all(counts == 0):
             return None
 
-        if self.detokenization_decision_rule == "first_id_layer":
-            return np.argmax(counts > 0).item()
-        if self.detokenization_decision_rule == "max_id_layer":
-            return np.argmax(counts).item()
-        elif self.detokenization_decision_rule == "last_id_layer":
-            return (len(counts) - np.argmax((counts > 0)[::-1]) - 1).item()
-        elif self.detokenization_decision_rule == "first_layer_with_2_repeats":
-            return (np.argmax(counts >= 2)).item()
-        elif self.detokenization_decision_rule == "last_layer_with_2_repeats":
-            return (len(counts) - np.argmax((counts >= 2)[::-1]) - 1).item()
+        result = None
+        if decision_rule in ["first_id_layer", "1st_id_layer"]:
+            result = np.argmax(counts > 0).item()
+        if decision_rule in ["2nd_id_layer", "3rd_id_layer", "4th_id_layer", "4th_id_layer"]:
+            indices = np.where(counts > 0)[0]
+            if (decision_rule == "4th_id_layer") and (len(indices) >= 4):
+                result = indices[3]
+            elif (decision_rule in ["3rd_id_layer", "4th_id_layer"]) and (len(indices) >= 3):
+                result = indices[2]
+            elif len(indices) >= 2:
+                result = indices[1]
+            elif len(indices) >= 1:
+                result = indices[0]
+        if decision_rule == "max_id_layer":
+            result = np.argmax(counts).item()
+        elif decision_rule == "last_id_layer":
+            result = (len(counts) - np.argmax((counts > 0)[::-1]) - 1).item()
+        elif decision_rule == "first_layer_with_2_repeats":
+            result = (np.argmax(counts >= 2)).item()
+        elif decision_rule == "last_layer_with_2_repeats":
+            result = (len(counts) - np.argmax((counts >= 2)[::-1]) - 1).item()
 
-        return None
+        if self.max_valid_layer is not None and result > self.max_valid_layer:
+            # default to first id layer
+            result = np.argmax(counts > 0).item()
+
+        # if result is not None:
+        #     # hack to change layer, TODO remove
+        #     return max(2, result-5)
+
+        return result
 
     def compute_entries_for_word(
             self, word: str
@@ -214,17 +259,19 @@ class DetokenizationVocabularyExpander(VocabularyModifier):
             patchscopes_description_by_layers = self.patchscopes_results[word]
             last_token_hidden_states = self.patchscopes_retriever.extract_hidden_states(word)
 
-        target_layer = self._decide_detokenization_end_layer(word, patchscopes_description_by_layers)
+        target_layer = target_layer_E = self._decide_detokenization_end_layer(word, patchscopes_description_by_layers)
+        if self.detokenization_decision_rule_E is not None:
+            target_layer_E = self._decide_detokenization_end_layer(
+                word, patchscopes_description_by_layers, self.detokenization_decision_rule_E)
 
         if target_layer is None:  # detokenization did not occur
             return None, None
 
-        target_as_embedding = target_as_lm_head = last_token_hidden_states[target_layer]
+        target_as_embedding = last_token_hidden_states[target_layer_E]
+        target_as_lm_head = last_token_hidden_states[target_layer]
 
-        target_as_embedding = self.translators.to_embedding(target_as_embedding, target_layer+1).to(
-            self.model.get_input_embeddings().weight.dtype)
-        target_as_lm_head = self.translators.to_lm_head(target_as_lm_head, target_layer+1).to(
-            self.model.get_input_embeddings().weight.dtype)
+        target_as_embedding = self.translators.to_embedding(target_as_embedding, target_layer_E+1).to(self.model.get_input_embeddings().weight.dtype)
+        target_as_lm_head = self.translators.to_lm_head(target_as_lm_head, target_layer+1).to(self.model.get_output_embeddings().weight.dtype)
 
         return target_as_embedding, target_as_lm_head
 

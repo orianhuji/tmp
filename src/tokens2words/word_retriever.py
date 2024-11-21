@@ -75,7 +75,7 @@ class PatchscopesRetriever(WordRetrieverBase):
             hidden_states = hidden_states.unsqueeze(0)
 
         inputs_embeds = self.model.get_input_embeddings()(self.prompt_input_ids.to(self.model.device)).unsqueeze(0)
-        batched_patchscope_inputs = inputs_embeds.repeat(len(hidden_states), 1, 1)
+        batched_patchscope_inputs = inputs_embeds.repeat(len(hidden_states), 1, 1).to(hidden_states.dtype)
         batched_patchscope_inputs[:, self.prompt_target_idx] = hidden_states.unsqueeze(1).to(self.model.device)
 
         attention_mask = (self.prompt_input_ids != self.tokenizer.eos_token_id).long().unsqueeze(0).repeat(
