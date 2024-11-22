@@ -108,7 +108,7 @@ class VocabularyModifier(ABC):
             self.new_words.append(word)
             if finalize:
                 self.tokenizer.add_tokens([word])
-                self.model.resize_token_embeddings(len(self.tokenizer) + num_added_tokens)
+                self.model.resize_token_embeddings(len(self.tokenizer) + num_added_tokens, mean_resizing=False)
                 new_token_idx = len(self.tokenizer) - 1
                 if self.add_to_core_vocab:
                     new_token_idx -= self.num_special_tokens
@@ -278,4 +278,9 @@ class DetokenizationVocabularyExpander(VocabularyModifier):
     def get_patchscopes_results(self):
         return pd.DataFrame.from_records(self.patchscopes_results)
 
-
+    def calibrate_new_lm_head_entries(self, dataset, lr=1e-4, lr_schedule="linear", num_epochs=1, max_length=256, n_warmup_steps=0, clip_grad_norm=1.0):
+        from .utils.calibration_utils import get_calibration_model, train_calibration_model, merge_calibrated_weights_to_hf_model
+        calibration_model = get_calibration_model(self.model, self.orig_vocab_size, len(self.new_words))
+        calibration_model = train_calibration_model(calibration_model, self.tokenizer, dataset, lr=lr, lr_schedule=lr_schedule, num_epochs=num_epochs, max_length=max_length, n_warmup_steps=n_warmup_steps, clip_grad_norm=clip_grad_norm)
+        self.model = merge_calibrated_weights_to_hf_model(calibration_model, self.model)
+        return self.model

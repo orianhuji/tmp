@@ -6,6 +6,8 @@ import argparse
 import os
 import gc
 import json
+import pdb
+
 import pandas as pd
 import numpy as np
 from tabulate import tabulate
@@ -158,7 +160,6 @@ def eval_lm(
             compute_target_metrics=True, compute_subsequent_metrics=True, compute_perplexity=False,
             clip_logits_kwargs=None,
             debug=False):
-
         target_results = dict()  # will hold metrics for all the new words we add or their original tokenization
         background_results = dict()  # will hold metrics for all background tokens, i.e., not the ones we add or replace
         if compute_subsequent_metrics:
@@ -225,60 +226,9 @@ def eval_lm(
                 # target_results["original_mrr"] = ((1 / orig_rank)[target_mask_bool]).detach().cpu().numpy()
                 target_results["sum_mrr"] = ((1 / torch.minimum(orig_rank, rank))[target_mask_bool]).detach().cpu().numpy()
         if debug:
-            clipped_logits, over_excited_mask = _clip_overly_excited_new_logits(logits)
-            top2 = clipped_logits.argmax(-1)
-            (labels == top1)[attention_mask_bool].to(float).mean()
-            (labels == top2)[attention_mask_bool].to(float).mean()
-            (subsequent_labels == top1[:, 1:])[subsequent_attention_mask_bool].to(float).mean()
-            (subsequent_labels == top2[:, 1:])[subsequent_attention_mask_bool].to(float).mean()
-            (labels == top1)[target_mask_bool].to(float).mean()
-            (labels == top2)[target_mask_bool].to(float).mean()
-
-            top0 = logits[:, :, :32000].argmax(-1)
-            xx = (top1 != labels) & (top0 == labels) & attention_mask_bool
-            agree_xx = (top1 == labels) & (top0 == labels) & attention_mask_bool
-            xx_logits = logits[..., :32000][xx].topk(logits.shape[-1]-32000).values.detach().cpu().numpy()
-            xx_new_logits = logits[..., 32000:][xx].detach().cpu().numpy()
-            # i = 1; (xx_new_logits[i] / xx_logits[i].max() > 0.8).mean(); (xx_logits[i] / xx_logits[i].max() > 0.8).mean()
-
             import pdb; pdb.set_trace()
-
-            # from .utils.logits_utils import weighted_distribution_matching, truncated_quantile_mapping, density_based_mapping
-            # from collections import Counter
-            # fails_to_predict = Counter()
-            # preceeds_failures = Counter()
-            # kde = truncated_quantile_mapping(xx_logits[1], xx_new_logits[1])
-            # tokenizer.batch_decode(labels[:, :][xx[:, :]])
-            # tokenizer.batch_decode(labels[:, :-1][xx[:, 1:]])
-            # tokenizer.batch_decode(top1[:, :][xx[:, :]])
-            # print("\n\n".join(tokenizer.batch_decode(labels)))
-            # fails_to_predict.update(labels[:, :][xx[:, :]].cpu().tolist())
-            # preceeds_failures.update(labels[:, :-1][xx[:, 1:]].cpu().tolist())
-            # logits2 = deepcopy(logits)
-            # logits2[:, :, 32000:] *= logits[:, :, :32000].std(dim=(0,1)).mean() / logits[:, :, 32000:].std(dim=(0, 1))
-            # top2 = logits2.argmax(-1)
-            # (top1 == labels)[attention_mask_bool].to(float).mean()
-            # (top2 == labels)[attention_mask_bool].to(float).mean()
-            # (top1 == labels)[target_mask_bool].to(float).mean()
-            # (top2 == labels)[target_mask_bool].to(float).mean()
-            # (top1[:, 1:] == subsequent_labels)[subsequent_attention_mask_bool].to(float).mean()
-            # (top2[:, 1:] == subsequent_labels)[subsequent_attention_mask_bool].to(float).mean()
         del rank
         return background_results, target_results
-
-    # def _compute_comparative_metrics(baseline_logits, new_logits, attention_mask, compute_subsequent_metrics=True):
-    #     background_results = dict()
-    #
-    #     # compute agreement between baseline and new-vocab model
-    #     baseline_top1 = baseline_logits.argmax(dim=-1)
-    #     new_top1 = new_logits.argmax(dim=-1)
-    #     background_results["top1_agreement"] = (
-    #                 ((baseline_top1 == new_top1) * attention_mask).sum() / attention_mask.sum()).detach().cpu().numpy()
-    #     if compute_subsequent_metrics:
-    #         subsequent_attention_mask = get_last_zero_in_every_seq_mask(attention_mask[..., :-1].contiguous())
-    #         background_results["subsequent_top1_agreement"] = (((baseline_top1[..., 1:] == new_top1[...,
-    #                                                                  1:]) * subsequent_attention_mask).sum() / subsequent_attention_mask.sum()).detach().cpu().numpy()
-    #     return background_results
 
     def _add_start_token(batch):
         bos_tokens_tensor = torch.tensor([[tokenizer.bos_token_id]] * batch["input_ids"].size(dim=0)).to(batch["input_ids"].device)
@@ -345,11 +295,6 @@ def eval_lm(
 
     baseline_vocab_dataloader = accelerator.free_memory(baseline_vocab_dataloader)
 
-
-    # import pdb; pdb.set_trace()
-    # batch = tokenizer("The results of this study are favorable", return_tensors="pt")
-    # batch["input_ids"] = batch["input_ids"].to(model.device); batch["attention_mask"] = batch["attention_mask"].to(model.device)
-    # with torch.no_grad(): x = model(**batch); xlogits = x.logits[0]; xtop1 = xlogits.argmax(dim=-1); tokenizer.decode(xtop1)
     gc.collect()
     torch.cuda.empty_cache()
     expanded_vocab_dataloader = accelerator.prepare(expanded_vocab_dataloader)
@@ -404,13 +349,6 @@ def eval_lm(
             background_metrics['expanded_E'][metric_name].append(metric_value)
         for metric_name, metric_value in target_results.items():
             target_metrics['expanded_E'][metric_name].append(metric_value)
-
-        # if new_token_ids is not None:
-        #     shift_logits = shift_logits[:, :, :-len(new_token_ids)]
-        #     shift_labels[ignore_mask] = tokenizer.bos_token_id
-
-        # for metric_name, metric_value in _compute_comparative_metrics(baseline_model_logits, fully_expanded_logits, shift_attention_mask_batch):
-        #     metrics_per_example[metric_name].append(metric_value)
 
     expanded_vocab_dataloader = accelerator.free_memory(expanded_vocab_dataloader)
     gc.collect()
@@ -544,18 +482,6 @@ def main(args):
     output_dir = os.path.join(args.output_dir, args.exp_name)
     os.makedirs(output_dir, exist_ok=True)
 
-    logger.info("Loading model...")
-    mixed_precision = "bf16" if torch.cuda.is_bf16_supported() else "fp16"
-    accelerator = Accelerator(mixed_precision=mixed_precision)
-    model = AutoModelForCausalLM.from_pretrained(args.model_name, torch_dtype=torch.bfloat16 if mixed_precision == "bf16" else torch.float16)
-
-    if args.early_exit_layer is not None:
-        model.model.forward = types.MethodType(
-            get_early_exit_forward(exit_layer=args.early_exit_layer), model.model
-        )
-        model.config.num_hidden_layers = args.early_exit_layer
-
-    model = accelerator.prepare(model)
     tokenizer = AutoTokenizer.from_pretrained(args.model_name)
     baseline_tokenizer = AutoTokenizer.from_pretrained(args.model_name)
     logger.info("*** Evaluating expanding input vocabulary ***")
@@ -568,6 +494,18 @@ def main(args):
     # # for debugging
     # new_words = new_words[:100]
 
+    logger.info("Loading model...")
+    mixed_precision = "bf16" if torch.cuda.is_bf16_supported() else "fp16"
+    accelerator = Accelerator(mixed_precision=mixed_precision)
+    model = AutoModelForCausalLM.from_pretrained(args.model_name, torch_dtype=torch.bfloat16 if mixed_precision == "bf16" else torch.float16)
+
+    if args.early_exit_layer is not None:
+        model.model.forward = types.MethodType(
+            get_early_exit_forward(exit_layer=args.early_exit_layer), model.model
+        )
+        model.config.num_hidden_layers = args.early_exit_layer
+    model = accelerator.prepare(model)
+
     logger.info("Running patchscopes on new words...")
     patchscopes_retriever, patchscopes_results = prepare_patchscopes_retriever(args, model, baseline_tokenizer)
 
@@ -575,112 +513,6 @@ def main(args):
     translators = prepare_translators(args, model, tokenizer)
     if not args.translators_path:
         torch.save(translators, os.path.join(output_dir, "translators.pt"))
-
-    # from .utils.model_utils import extract_vocab_hidden_states, extract_token_i_hidden_states
-    # import torch.nn.functional as F
-    # from .utils.procrustes.orthogonal import orthogonal as orthogonal_procrustes
-    # # from .utils.procrustes.rotational import rotational as rotational_procrustes
-    # # from .utils.procrustes.symmetric import symmetric as symmetric_procrustes
-    # vocab_h = extract_vocab_hidden_states(model, tokenizer)
-    # embedding = model.get_input_embeddings().weight.data.cpu().to(torch.float32)
-    # lm_head = model.get_output_embeddings().weight.data.cpu().to(torch.float32)
-    # layer_i = 4
-    # vocab_layer_h = vocab_h[layer_i].cpu().to(torch.float32)
-    # # norm_h = (curr_vocab_h - bias_h).std(-1)
-    # # norm_h = torch.norm(vocab_layer_h, p=2, dim=-1).unsqueeze(1)
-    # # norm_u = torch.norm(lm_head, p=2, dim=-1).unsqueeze(1)
-    # # curr_vocab_h = (vocab_layer_h - vocab_layer_h.mean(-1).unsqueeze(1)) / vocab_layer_h.std(-1).unsqueeze(1)
-    # sd_u = lm_head.std(-1).mean()
-    # bias_h = vocab_layer_h.mean(dim=0)
-    # bias_u = lm_head.mean(dim=0)
-    # bias_e = embedding.mean(dim=0)
-    # # curr_u = (lm_head - lm_head.mean(-1).unsqueeze(1)) / lm_head.std(-1).unsqueeze(1)
-    # # curr_vocab_h = (vocab_layer_h) / vocab_layer_h.std(-1).unsqueeze(1)
-    # # curr_u = (lm_head) / lm_head.std(-1).unsqueeze(1)
-    # curr_u = lm_head - bias_u  # bias_u is critical! only needed during training, re-adding it inference hurts performance
-    # curr_e = embedding - bias_e  # bias_u is critical! only needed during training, re-adding it inference hurts performance
-    # # curr_u = (curr_u - curr_u.mean(-1).unsqueeze(1)) / curr_u.std(-1).unsqueeze(1)  # trying this, not sure about its effect
-    # # curr_u = (curr_u) / curr_u.std(-1).unsqueeze(1)  # trying this, not sure about its effect
-    # curr_vocab_h = (vocab_layer_h - bias_h) # remove bias_h when fitting, but don't use it during inference - puts the distribution next to all the weird tokens
-    # # curr_vocab_h = (curr_vocab_h - curr_vocab_h.mean(-1).unsqueeze(1)) / curr_vocab_h.std(-1).unsqueeze(1)
-    # # curr_vocab_h = (curr_vocab_h) / curr_vocab_h.std(-1).unsqueeze(1)
-    #
-    # # curr_vocab_h = (curr_vocab_h - bias_h) / curr_vocab_h.std(-1).unsqueeze(1)
-    #
-    # # proc = orthogonal_procrustes((curr_vocab_h - bias_h).numpy(), (lm_head - bias_u).numpy(), lapack_driver="gesdd", scale=False, translate=False)
-    # # "scale" parameter in procrustes doesn't matter
-    # proc = orthogonal_procrustes((curr_vocab_h).numpy(), (curr_u).numpy(), lapack_driver="gesdd", scale=False, translate=False)
-    # procc_u = torch.tensor(proc.t.T, dtype=torch.float)
-    # proc = orthogonal_procrustes((curr_vocab_h).numpy(), (curr_e).numpy(), lapack_driver="gesdd", scale=False, translate=False)
-    # procc_e = torch.tensor(proc.t.T, dtype=torch.float)
-    # e2u = orthogonal_procrustes((curr_e).numpy(), (curr_u).numpy(), lapack_driver="gesdd", scale=False, translate=False)
-    # e2u = torch.tensor(e2u.t.T, dtype=torch.float)
-
-    # intercept = (curr_u - (curr_vocab_h @ procc)).mean(0)
-
-    # from sklearn.linear_model import LinearRegression
-    # lreg = LinearRegression(fit_intercept=False).fit((curr_vocab_h).numpy(), (curr_u).numpy())
-    # procc = torch.tensor(lreg.coef_.T, dtype=torch.float)
-    # proc = orthogonal_procrustes((curr_vocab_h).numpy(), (lm_head - bias_u).numpy(), lapack_driver="gesdd", scale=False, translate=False)
-    # proc = orthogonal_procrustes(curr_vocab_h.numpy(), (lm_head - bias_u).numpy(), lapack_driver="gesdd", scale=False, translate=False)
-    # proc = orthogonal_procrustes((curr_vocab_h - bias_h).numpy()/vocab_fro.numpy(), (lm_head - bias_u).numpy()/lm_head_fro.numpy(), lapack_driver="gesdd", scale=False, translate=False)
-    # proc = orthogonal_procrustes((curr_vocab_h - bias_h).numpy()/norm_h.numpy(), (lm_head - bias_u).numpy()/norm_u.numpy(), lapack_driver="gesdd", scale=False, translate=False)
-    # proc = orthogonal_procrustes(curr_vocab_h.numpy(), (embedding - bias_u).numpy(), lapack_driver="gesdd", scale=False, translate=False)
-    # procc = torch.tensor(proc.t.T, dtype=torch.float)
-    # curr_vocab_h = ((curr_vocab_h - bias_h) / norm_h.unsqueeze(1))
-    #
-    # import pdb; pdb.set_trace()
-    # # # bias = (vocab_h[layer_i] @ procc - lm_head).mean(axis=0)
-    # # # proc = orthogonal_procrustes(vocab_h[layer_i].numpy(), lm_head.numpy(), lapack_driver="gesdd")
-    # # # proc = orthogonal_procrustes(curr_vocab_h.numpy(), lm_head.numpy(), lapack_driver="gesdd", scale=False, translate=False)
-    # # # proc = orthogonal_procrustes((curr_vocab_h - bias_h).numpy(), (lm_head - bias_u).numpy(), lapack_driver="gesdd", scale=False, translate=False)
-    # # # proc = orthogonal_procrustes((curr_vocab_h.cpu().to(torch.float32) - bias_h).numpy(), (lm_head.repeat((6, 1)) - bias_u).numpy(), lapack_driver="gesdd", scale=False, translate=False)
-    # #
-    # # hello_idx = 13406; hello_h = vocab_h[layer_i][hello_idx]; hello_e = embedding[hello_idx]; hello_u = lm_head[hello_idx]
-    # # desc, word_h = patchscopes_retriever.get_hidden_states_and_retrieve_word("Bonaparte")
-    # desc, word_h = patchscopes_retriever.get_hidden_states_and_retrieve_word("grenadier")
-    # # # y_u = (procc @ (hello_h - hello_h.mean())/hello_h.std() + bias_u)
-    # # y_u = (procc @ ((hello_h - hello_h.mean())/hello_h.std())) * hello_h.std()
-    # # y_u = (procc @ ((hello_h - hello_h.mean())/hello_h.std())) * sd_u
-    #
-    # # this is better to soften the output probabilities, make them more reasonable ((sd_u / hello_h.std()))
-    # hello_h = word_h[3]
-    # # y_u = (procc @ ((hello_h - hello_h.mean())/hello_h.std())) * (sd_u / hello_h.std())
-    # # y_u = (procc @ ((hello_h - hello_h.mean())/hello_h.std())) * sd_u
-    # # y_u = (procc @ ((hello_h - hello_h.mean())/hello_h.std())) * sd_u
-    # # y_u = (procc @ ((hello_h)/hello_h.std())) * (sd_u / hello_h.std())
-    # y_u = (procc @ (hello_h))
-    # y_e = (procc @ (hello_h))
-    # y_u = (e2u @ y_e)
-    # x = lm_head.to(torch.float32) @ (y_u); print(x.topk(10).values); tokenizer.batch_decode(x.topk(40).indices)
-    # x = embedding.to(torch.float32) @ (y_e); print(x.topk(10).values); tokenizer.batch_decode(x.topk(40).indices)
-
-    # y_u = (procc @ (hello_h/hello_h.std())) * (sd_u / hello_h.std())
-    # mean_norn_u = torch.norm(lm_head, p=2, dim=-1).mean()
-    # renorm = mean_norn_u / torch.norm(y_u, p=2)
-    # y_u = y_u * renorm
-    # y_u = (procc @ ((hello_h - hello_h.mean())/hello_h.std()) + bias_u) * hello_h.std()
-    # # y_u = (procc @ ((hello_h)/hello_h.std()) + bias_u) * hello_h.std()
-    # # y_u = ((procc @ (hello_h))/hello_h.std() + bias_u) * hello_h.std()
-    # y_u = (procc @ (hello_h - bias_h)/vocab_fro + bias_u)*lm_head_fro
-    # y_u = (procc @ (hello_h - bias_h)/torch.norm((hello_h), p=2)*norm_u.mean() + bias_u)
-    # # y_u = (procc @ (hello_h - bias_h)/hello_h.std() + bias_u) * hello_h.std()
-
-    # x = embedding.to(torch.float32) @ y_u;
-
-    # # y_u = procc @ (hello_h - bias_h)
-    # # y_u = procc @ (hello_h - bias_h) + bias_u
-    #
-    #
-    # # y_u = procc @ hello_h + bias
-    # # y_u = procc @ hello_h + bias - bias2
-    # # y_u = translators.to_lm_head(hello_h, layer_i)
-    # # y_u = translators.to_embedding(hello_h, 2)
-    #
-    # # tokenizer.batch_decode(x_gold.topk(10).indices)
-    # # y_e = translators.to_embedding(hello_h, layer_i)
-    # # F.cosine_similarity(hello_u.float(), y_u.float(), dim=0)
-    # # F.mse_loss(hello_u.float(), y_u.float())
 
     logger.info("Adding new words to model vocabulary...")
     model.eval()
@@ -696,6 +528,20 @@ def main(args):
         early_exit_layer=args.early_exit_layer,
     )
     model, tokenizer = vocab_modifier.add_words_to_vocab(new_words)
+
+    if args.rescale_logits:
+        from .utils.calibration_utils import compute_logits_std_dev
+        calibration_dataset = load_lm_dataset(args.calibration_dataset)
+        calibration_dataset = calibration_dataset[args.calibration_dataset_split]
+        logits_std_dev, logits_scales = compute_logits_std_dev(model, tokenizer, vocab_modifier.orig_vocab_size, calibration_dataset)
+        with torch.no_grad():
+            model.lm_head.weight.data *= logits_scales.unsqueeze(-1)
+
+    if args.calibrate_new_lm_head:
+        logger.info("Calibrating new LM head entries...")
+        calibration_dataset = load_lm_dataset(args.calibration_dataset)
+        calibration_dataset = calibration_dataset[args.calibration_dataset_split]
+        model = vocab_modifier.calibrate_new_lm_head_entries(calibration_dataset, lr=args.calibration_lr, lr_schedule=args.calibration_lr_schedule, num_epochs=args.calibration_num_epochs, max_length=256, n_warmup_steps=args.calibration_n_warmup_steps, clip_grad_norm=args.calibration_clip_grad_norm,)
 
     logger.info("Done adding words! Patchscopes success rate: "
                 f"{len(vocab_modifier.new_words) / (len(vocab_modifier.new_words) + len(vocab_modifier.failed_words))}")
@@ -723,6 +569,7 @@ def main(args):
     seq_lens = {len(v) for v in new_tokens_to_replaced_token_seqs.values()}
     replaced_token_seqs_by_len = {curr_seq_len: [seq for seq in new_tokens_to_replaced_token_seqs.values() if len(seq) == curr_seq_len] for curr_seq_len in seq_lens}
     new_token_to_original_first_token = {k: v[0] for k, v in new_tokens_to_replaced_token_seqs.items()}
+
     background_metrics, target_metrics, other_metrics = eval_lm(
         model, accelerator, tokenizer, baseline_tokenizer, eval_dataset,
         batch_size=4, top_ks=[5, 10], new_token_ids=vocab_modifier.new_token_ids,
@@ -731,7 +578,7 @@ def main(args):
         eval_max_samples=args.eval_max_samples, text_col_name=args.eval_dataset_text_col,
         clip_logits_kwargs={
             "clip_new_logits": args.clip_new_logits, "vocab_size": len(baseline_tokenizer), "max_line": args.clip_max_line,
-            "gamma": args.clip_gamma}
+            "gamma": args.clip_gamma},
     )
 
     other_metrics["n_new_words"] = len(vocab_modifier.new_words)
@@ -764,6 +611,7 @@ def parse_args():
     parser.add_argument("--exp_name", type=str)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--model_name", type=str, default="meta-llama/Llama-3.1-8B")
+    parser.add_argument("--run_old_eval", action="store_true", default=False)
     parser.add_argument("--add_new_words_to_core_vocab", action="store_true", default=False)
     parser.add_argument("--add_space_before_lowercase_words", action="store_true", default=False)
     parser.add_argument("--detokenization_decision_rule", type=str, default="first_id_layer")
@@ -786,6 +634,15 @@ def parse_args():
     parser.add_argument("--translators_procrustes_layers", nargs="+", type=int, default=None)
     parser.add_argument("--translators_learn_on_space_prefixed_words_only", action="store_true", default=False)
     parser.add_argument("--translators_fit_min_word_len", type=int, default=None)
+    parser.add_argument("--rescale_logits", action="store_true", default=False)
+    parser.add_argument("--calibrate_new_lm_head", action="store_true", default=False)
+    parser.add_argument("--calibration_dataset", type=str, default=None)
+    parser.add_argument("--calibration_dataset_split", type=str, default=None)
+    parser.add_argument("--calibration_lr", type=float, default=0.0001)
+    parser.add_argument("--calibration_clip_grad_norm", type=float, default=1.0)
+    parser.add_argument("--calibration_lr_schedule", type=str, default="linear")
+    parser.add_argument("--calibration_n_warmup_steps", type=float, default=0.03)
+    parser.add_argument("--calibration_num_epochs", type=int, default=1)
     parser.add_argument("--eval_dataset", type=str, default="wikitext")
     parser.add_argument("--eval_dataset_language", type=str, default=None)
     parser.add_argument("--eval_max_samples", type=int, default=None)
