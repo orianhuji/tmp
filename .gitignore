@@ -1,0 +1,4 @@
+data/hewiki-latest-pages-articles.xml
+data/he_wikipedia.jsonl
+**/__pycache__/
+throttle.ctrl
