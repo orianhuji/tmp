@@ -27,13 +27,13 @@ from transformers import PreTrainedModel
 
 
 Model = Union[PreTrainedModel]
-Norm = Union[
-    nn.LayerNorm,
-    models.llama.modeling_llama.LlamaRMSNorm,
-    models.gemma.modeling_gemma.GemmaRMSNorm,
-    models.gemma2.modeling_gemma2.Gemma2RMSNorm,
-    nn.Module,
-]
+# Norm = Union[
+#     nn.LayerNorm,
+#     models.llama.modeling_llama.LlamaRMSNorm,
+#     models.gemma.modeling_gemma.GemmaRMSNorm,
+#     models.gemma2.modeling_gemma2.Gemma2RMSNorm,
+#     nn.Module,
+# ]
 
 
 def get_unembedding_matrix(model: Model) -> nn.Linear:
@@ -58,7 +58,7 @@ def get_embedding_matrix(model: nn.Module) -> nn.Embedding:
         raise ValueError(f"Model class {type(model)} not recognized!")
 
 
-def get_final_norm(model: Model) -> Norm:
+def get_final_norm(model: Model):
     """Get the final norm from a model.
 
     This isn't standardized across models, so this will need to be updated as
@@ -104,7 +104,7 @@ def get_final_norm(model: Model) -> Norm:
 class Unembed(nn.Module):
     """Module that maps transformer hidden states to logits (and vice versa)."""
 
-    final_norm: Norm
+    final_norm: any
     unembedding: nn.Linear
 
     def __init__(
